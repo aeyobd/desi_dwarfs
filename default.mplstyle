@@ -1,0 +1,57 @@
+#---------------Figure----------------
+# default: 6.4, 4.8  (4/3 ratio)
+figure.figsize:		3.33333333, 2.2570226
+figure.dpi:		    200
+figure.facecolor:	white
+
+
+# savefigure like a normal person
+savefig.facecolor: 	white
+savefig.bbox:       tight 
+
+
+# 3: default is type3
+# this enables truetype
+pdf.fonttype: 		42
+
+
+#---------------Latex----------------
+text.usetex:		    False
+# mathtext.fontset: 	    custom
+# text.latex.preamble:    \usepackage{amsmath} \usepackage{txfonts} \usepackage[T1]{fontenc}
+# text.latex.unicode:     True
+
+# avoid latex encoding issues
+# axes.unicode_minus:	    False
+#
+axes.formatter.use_mathtext:    True
+
+
+#---------------Fonts----------------
+font.family:		serif
+# font.serif: 		Times
+text.antialiased:   True
+
+#---------------Plotting-------------
+
+image.cmap:             arya
+
+#---------------Legend----------------
+legend.numpoints:	    1
+legend.frameon:		    False
+legend.handletextpad:	0.25
+
+
+#---------------Ticks----------------
+
+xtick.direction:	    in
+ytick.direction:	    in
+xtick.top:		        True
+ytick.right:		    True
+xtick.minor.visible:	True
+ytick.minor.visible:	True
+
+
+# 
+patch.edgecolor:	none
+hist.bins:         50

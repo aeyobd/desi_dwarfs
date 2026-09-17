@@ -1,82 +1,117 @@
 import re
+import pyneb
 
-emline_cols = [
-    'nev3346', 
-    'nev3426',
-    'oii3726',
-    'oii3729',
-    'neiii3869',
-    'neiii3967',
-    'hepsilon',
-    'hei4026', 
-    'hdelta',
-    'hgamma', 
-    'oiii4363',
-    'hei4471', 
-    'heii4686', 
-    'hbeta',
-    'oiii4959',
-    'oiii5007',
-    'nii5755',
-    'hei5876', 
-    'oi6300', 
-    'siii6312',
-    'nii6548',
-    'halpha',  
-    'nii6583',
-    'sii6716', 
-    'sii6731',  
-    'hei7065',
-    'ariii7136',
-    'hei7281',
-    'oii7320', 
-    'oii7331',
-    'ariii7751',
-    'siii9071', 
-    'siii9533',
+emission_lines = [
+    'nev_3346', 
+    'ne_v_3426',
+    'o_ii_3726',
+    'o_ii_3729',
+    'ne_iii_3869',
+    'ne_iii_3967',
+    'h_epsilon',
+    'he_i_4026', 
+    'h_delta',
+    'h_gamma', 
+    'o_iii_4363',
+    'he_i_4471', 
+    'he_ii_4686', 
+    'h_beta',
+    'o_iii_4959',
+    'o_iii_5007',
+    'n_ii_5755',
+    'he_i_5876', 
+    'o_i_6300', 
+    's_iii_6312',
+    'n_ii_6548',
+    'h_alpha',  
+    'n_ii_6583',
+    's_ii_6716', 
+    's_ii_6731',  
+    'he_i_7065',
+    'ar_iii_7136',
+    'he_i_7281',
+    'o_ii_7320', 
+    'o_ii_7331',
+    'ar_iii_7751',
+    's_iii_9071', 
+    's_iii_9533',
 ]
 
 
-balmer_lines = {
-    "halpha": 6565,
-    "hbeta": 4861,
-    "hgamma": 4340,
-    "hdelta": 4102,
-    "hepsilon": 3970,
+
+
+
+balmer_line_wavelengths = {
+    "h_alpha": 6563,
+    "h_beta": 4861,
+    "h_gamma": 4340,
+    "h_delta": 4102,
+    "h_epsilon": 3970,
 }
 
 
 
 line_labels = {
-    "halpha": r"H $\alpha$",
-    "hbeta": r"H $\beta$",
-    "hgamma": r"H $\gamma$",
-    "hdelta": r"H $\delta$",
-    "hepsilon": r"H $\epsilon$",
-    "nev": "[Ne V]",
-    "oii": "[O II]",
-    "neiii": "[Ne III]",
-    "hei": "[He I]",
-    "heii": "[He II]",
-    "oiii": "[O III]",
-    "nii": "[N II]",
-    "oi": "[O I]",
-    "siii": "[S III]",
-    "sii": "[S II]", 
-    "ariii": "[Ar III]",
+    "h_alpha": r"H $\alpha$",
+    "h_beta": r"H $\beta$",
+    "h_gamma": r"H $\gamma$",
+    "h_delta": r"H $\delta$",
+    "h_epsilon": r"H $\epsilon$",
 }
 
 
-def retrieve_wavelength(line):
-    matches = re.findall(r"\d{4}", line)
+def get_line_element(emline):
+    return emline.split("_")[0]
+
+
+def get_wavelength(emline):
+    if get_line_element(emline) == "h":
+        return  balmer_line_wavelengths[emline]
+        
+    matches = re.findall(r"\d{4}", emline)
     if len(matches) == 1:
         return int(matches[0])
+    else:
+        print("bad format for line: ", emline)
+        print("we expect the line to be of the form `el_iii_1000` or a balmer line")
 
-    if line in balmer_lines.keys():
-        return balmer_lines[line]
+
+def roman_num_to_int(roman):
+    return {
+        "i": 1,
+        "ii": 2,
+        "iii": 3,
+        "iv": 4,
+        "v": 5,
+        "vi": 6,
+        "vii": 7,
+        "viii": 8,
+        "ix": 9,
+        "x": 10
+    }[roman]
+    
+
+def get_species(emline):
+    if emline in balmer_line_wavelengths.keys():
+        return "ii"
+    else:
+        return emline.split("_")[1]
 
 
-    raise Exception(f"Line not known {line}")
+def to_elsm_format(emline):
+    return emline.replace("_", "")
+
+
+def get_pyneb_line(emline: str):
+    if emline in balmer_line_wavelengths.keys():
+        wave = get_named_wavelength(emline)
+        Ha = pyneb.EmissionLine(label=f"H1r_{wave}A")
+
+    ele = get_line_element(emline).title()
+    wave = get_line_named_wavelength(emline)
+    spec = roman_num_to_int(get_species(emline))
+
+    return pyneb.EmissionLine(ele, spec, wave)
 
 
 
@@ -84,8 +119,10 @@ def retrieve_wavelength(line):
 
 def retrieve_good_lines(galaxy, snr_min=3):
     good_lines = []
-    for line in emline_cols:
-        if galaxy[line + "_flux"] / galaxy[line + "_fluxerr"] > snr_min:
+    for line in emission_lines:
+        line_elsm = to_elsm_format(line)
+        snr = galaxy[line_elsm + "_flux"] / galaxy[line_elsm + "_fluxerr"]
+        if snr > snr_min:
             good_lines.append(line)
 
     return good_lines
@@ -105,12 +142,11 @@ def nicer_label(line):
 
 
 
-
 def plot_lines(meas, z=0):
     good_lines = retrieve_good_lines(meas)
 
     xlim = plt.gca().get_xlim()
-    for line in emline_cols:
+    for line in emission_lines:
         λ = retrieve_wavelength(line)
         λ = λ * (1 + z)
 
