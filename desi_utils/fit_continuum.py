@@ -1,5 +1,7 @@
 import os
 from copy import copy
+from dataclasses import dataclass, asdict, field
+import math
 
 import numpy as np
 from astropy import constants
@@ -8,47 +10,12 @@ import ppxf.ppxf_util as ppxf_utils
 import ppxf.sps_util as ppxf_lib
 from ppxf.ppxf import ppxf
 
+from .spectrum import Spectrum
+import tomli_w
+
+
 SPS_DIR = os.path.join(os.path.dirname(__file__), "..", "sps_templates")
 
-class ResampledSpectrum:
-    """
-        ResampledSpectrum(spectrum:)
-    
-    Resamples a spectrum from desi onto a log-uniform axis
-
-    Properties
-    ----------
-    flux : `np.array`
-        The flux of the spectrum
-    wavelength: `np.array` 
-        The wavelength of the spectrum in Angstroms
-    redshift : `float`
-        The redshift of the spectrum
-    wave_dispersion : `float`
-        The FWHM dispersion at every wavelength of the spectrum
-    
-
-    """
-
-    def __init__(self, spec, flux=False):
-        redshift = spec.meta["redshift"]
-        wave_dispersion = spec.meta["wave_sigma"]
-
-        flux_resam, log_lambda_resam, velscale_resam = ppxf_utils.log_rebin(spec.spectral_axis, spec.flux, flux=flux)
-        lambda_resam = np.exp(log_lambda_resam)
-        wave_dispersion_resam = np.interp(lambda_resam, spec.spectral_axis.value, wave_dispersion.value)
-
-        uncertainty = 1/np.sqrt(spec.uncertainty.array)
-        uncertainty[spec.uncertainty.array == 0] == np.inf
-        uncertainty_resam = np.interp(lambda_resam, spec.spectral_axis.value, uncertainty / np.median(flux_resam))
-        flux_resam /= np.median(flux_resam)
-
-        self.wavelength = lambda_resam
-        self.flux = flux_resam
-        self.wave_dispersion =  wave_dispersion_resam
-        self.uncertainty = uncertainty_resam
-        self.velscale = velscale_resam
-        self.redshift = redshift
 
 
 
@@ -63,7 +30,7 @@ def redshift_to_vel(redshift: float):
     return vel
 
 
-def load_sps(sps_file: str, spec:ResampledSpectrum, norm_range=[5070, 5950]):
+def load_sps(sps_file: str, spec:Spectrum, norm_range=[5070, 5950]):
     """
         load_sps(sps_file, redshift, lam_gal, fwhm_gal, 
         norm_range)
@@ -72,39 +39,30 @@ def load_sps(sps_file: str, spec:ResampledSpectrum, norm_range=[5070, 5950]):
     scaling by the redshift, and 
     """
     fwhm_gal_dic = {"lam": spec.wavelength, "fwhm": spec.wave_dispersion}
-    sps = ppxf_lib.sps_lib(os.path.join(SPS_DIR, sps_file), spec.velscale, fwhm_gal_dic, norm_range=norm_range)
+    sps = ppxf_lib.sps_lib(os.path.join(SPS_DIR, sps_file), spec.velocity_scale, fwhm_gal_dic, norm_range=norm_range)
     return sps
 
 
+@dataclass
 class SEDModel:
+    sps_file: str
 
-    def __init__(self, *, 
-            moments = [4, 2, 2],
-            ic_single = [None, 180.],
-            ic = None,
-            gas_reddening = 0, 
-            tie_balmer = False,
-            sps_file = None,
-            regul_err = 0.01
-        ):
-        
-        self.moments = moments
-        self.ic_single = ic_single
-        self.ic = ic
-        self.regul_err = regul_err
-        self.gas_reddening = gas_reddening
-        self.tie_balmer = tie_balmer
-        self.sps_file = sps_file
+    moments: list = field(default_factory=lambda: [4, 2, 2])
+    ic_single: list = field(default_factory=lambda: [math.nan, 180.])
+    ic: list = field(default_factory=list)
+    gas_reddening: float = 0.0
+    tie_balmer: bool = False
+    regul_err: float = 0.01
 
 
     def get_ic(self, redshift):
         vel = redshift_to_vel(redshift)
-        if self.ic is not None:
+        if len(self.ic) > 0:
             ic = self.ic
         else:
-            if self.ic_single[0] is None:
+            if math.isnan(self.ic_single[0]):
                 ic_single = copy(self.ic_single)
-                ic_single[0] = vel
+                ic_single[0] = float(vel)
             ic = [ic_single, ic_single, ic_single]
 
         return ic
@@ -133,10 +91,11 @@ class SEDModel:
 
         ic = self.get_ic(spectrum.redshift)
 
-        uncertainty = copy(spectrum.uncertainty)
+        uncertainty = copy(spectrum.uncertainty.value)
         uncertainty[~np.isfinite(uncertainty)] = 1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
+        uncertainty[uncertainty == 0] =  1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
 
-        p = ppxf(templates, spectrum.flux, uncertainty, spectrum.velscale, ic, 
+        p = ppxf(templates, spectrum.flux, uncertainty, spectrum.velocity_scale, ic, 
             moments = self.moments,
             degree = -1, mdegree = 10, 
             lam = spectrum.wavelength, 
@@ -158,6 +117,16 @@ class SEDModel:
         self.p_fit = p
 
         return p
+
+
+    def __str__(self):
+        d = {
+            "SEDModel": asdict(self)
+        }
+        return tomli_w.dumps(d)
+
+    def __repr__(self):
+        return str(self)
 
 
 

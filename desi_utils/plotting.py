@@ -1,16 +1,13 @@
 from matplotlib import pyplot as plt
 import numpy as np
-from .fit_continuum import ResampledSpectrum
-from specutils import Spectrum
+from .spectrum import Spectrum
 
 
 def get_spectra_xy(spec):
     if isinstance(spec, tuple):
         x, y = spec
-    elif isinstance(spec, ResampledSpectrum):
-        x, y = spec.wavelength, spec.flux
     elif isinstance(spec, Spectrum):
-        x, y = spec.spectral_axis, spec.flux
+        x, y = spec.wavelength, spec.flux
     else:
         raise Error(f"Unknown spectral type: {type(spec)}")
 

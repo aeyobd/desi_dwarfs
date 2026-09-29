@@ -3,15 +3,15 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Sequence
 
+from astropy import units as u
 import numpy as np
 import matplotlib.pyplot as plt
 import pymc as pm
 import pytensor.tensor as pt
 import arviz as az
 
-from specutils import Spectrum
-
-from.spectral_lines import get_wavelength
+from .spectral_lines import get_wavelength
+from .spectrum import Spectrum
 
 
 
@@ -23,6 +23,7 @@ class LineFitResult:
     line_names: list
     line_centers: list
     fit_continuum: bool
+    flux_unit: u.Quantity
 
     def summary(self, var_names=None):
         """Return an arviz summary table of the posterior."""
@@ -37,8 +38,10 @@ class LineFitResult:
         Return the posterior-mean model spectrum (and optionally the 94% HDI)
         evaluated on `wave` (defaults to the fitted wavelength grid).
         """
+
         if wave is None:
-            wave = self.wave
+            wave = self.spectrum.wavelength.value
+
         posterior = self.trace.posterior
         if hasattr(posterior, "to_dataset"):
             posterior = posterior.to_dataset()
@@ -58,7 +61,7 @@ class LineFitResult:
         if self.fit_continuum:
             c0 = post["c0"].values[None, :]
             c1 = post["c1"].values[None, :]
-            wave0 = self.wave.mean()
+            wave0 = wave.mean()
             model_samples = model_samples + c0 + c1 * (w[:, 0, :] - wave0)
 
         mean = model_samples.mean(axis=1)
@@ -68,18 +71,20 @@ class LineFitResult:
         hi = np.percentile(model_samples, 97, axis=1)
         return mean, lo, hi
 
+
     def plot_fit(self, ax=None, show_components=False):
         if ax is None:
             fig, ax = plt.subplots(figsize=(9, 5))
 
+        wave = self.spectrum.wavelength.value
         ax.errorbar(
-            self.wave, self.flux, yerr=self.flux_err,
+            self.spectrum.wavelength, self.spectrum.flux / self.flux_unit, yerr=self.spectrum.uncertainty / self.flux_unit,
             fmt=".", color="k", ms=12, label="data", zorder=2,
         )
 
         mean, lo, hi = self.best_fit_curve()
-        ax.plot(self.wave, mean, color="crimson", lw=2, label="total fit", zorder=3)
-        ax.fill_between(self.wave, lo, hi, color="crimson", alpha=0.2, zorder=2)
+        ax.plot(wave, mean, color="crimson", lw=2, label="total fit", zorder=3)
+        ax.fill_between(wave, lo, hi, color="crimson", alpha=0.2, zorder=2)
 
         if show_components:
             posterior = self.trace.posterior
@@ -90,13 +95,13 @@ class LineFitResult:
             mu = post_mean["mu"].values
             sigma = post_mean["sigma"].values
             for i, name in enumerate(self.line_names):
-                comp = amp[i] * np.exp(-0.5 * ((self.wave - mu[i]) / sigma[i]) ** 2)
+                comp = amp[i] * np.exp(-0.5 * ((wave - mu[i]) / sigma[i]) ** 2)
                 if self.fit_continuum:
                     c0 = float(post_mean["c0"].values)
                     c1 = float(post_mean["c1"].values)
-                    wave0 = self.wave.mean()
-                    comp = comp + c0 + c1 * (self.wave - wave0)
-                ax.plot(self.wave, comp, "--", lw=1.3, label=name, zorder=1)
+                    wave0 = wave.mean()
+                    comp = comp + c0 + c1 * (wave - wave0)
+                ax.plot(wave, comp, "--", lw=1.3, label=name, zorder=1)
 
         ax.set_xlabel("Wavelength")
         ax.set_ylabel("Flux")
@@ -112,11 +117,11 @@ class LineFitResult:
         line_id = np.where(np.array(self.line_names) == line)[0][0]
         line_center = self.line_centers[line_id]
 
-        filt = self.wave > line_center - wave_range
-        filt &= self.wave < line_center + wave_range
+        filt = wave > line_center - wave_range
+        filt &= wave < line_center + wave_range
         
         ax.errorbar(
-            self.wave[filt], self.flux[filt], yerr=self.flux_err[filt],
+            wave[filt], self.spectrum.flux[filt], yerr=self.spectrum.uncertainty[filt],
             fmt=".", color="k", ms=12, alpha=1, label="data", zorder=3,
         )
 
@@ -183,9 +188,8 @@ class LineFitResult:
 
 
 def fit_lines(
-    wave: np.ndarray,
-    flux: np.ndarray,
-    flux_err: np.ndarray | float | None,
+    spec: Spectrum,
+    flux_unit = 1e-17 * u.erg / u.cm**2 / u.s / u.Angstrom,
     line_names: Sequence[str] | None = None,
     amp_guess: Sequence[float] | None = None,
     sigma_guess: Sequence[float] | float | None = None,
@@ -205,11 +209,8 @@ def fit_lines(
 
     Parameters
     ----------
-    spectrrum, flux : 1D arrays
-        Continuum-subtracted spectrum (same units for wave as line_centers).
-    flux_err : 1D array, scalar, or None
-        Per-pixel flux uncertainty. If None, a single noise scale is fit
-        from the data (HalfNormal prior).
+    spectrum: desi_utils.Spectrum
+        Continuum-subtracted spectrum.
     line_centers : list of float
         Initial guesses for each line's central wavelength.
     line_names : list of str, optional
@@ -234,10 +235,12 @@ def fit_lines(
     -------
     LineFitResult
     """
-    wave = np.asarray(wave, dtype=float)
-    flux = np.asarray(flux, dtype=float)
+    wave = np.asarray(spec.wavelength.to("Angstrom"), dtype=float)
+    flux = (spec.flux / flux_unit).decompose()
+    flux_err = (spec.uncertainty / flux_unit).decompose()
+
     n_lines = len(line_names)
-    line_centers = [get_wavelength(line) for line in line_names]
+    line_centers = [get_wavelength(line) * (1 + spec.redshift) for line in line_names]
 
     dw = np.median(np.diff(np.sort(wave)))
     
@@ -255,9 +258,6 @@ def fit_lines(
     amp_guess = np.asarray(amp_guess, dtype=float)
     amp_guess = np.clip(amp_guess, 1e-6, None)
 
-    known_err = flux_err is not None
-    if known_err and np.isscalar(flux_err):
-        flux_err = np.full_like(flux, float(flux_err))
 
     wave0 = wave.mean()
     sigma_lo, sigma_hi = sigma_bounds
@@ -289,11 +289,7 @@ def fit_lines(
 
         pm.Deterministic("model_flux", model_flux)
 
-        if known_err:
-            pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
-        else:
-            noise = pm.HalfNormal("noise", sigma=np.nanstd(flux))
-            pm.Normal("obs", mu=model_flux, sigma=noise, observed=flux)
+        pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
 
         trace = pm.sample(
             draws=draws, tune=tune, chains=chains, cores=cores,
@@ -302,9 +298,9 @@ def fit_lines(
         )
 
     return LineFitResult(
-        trace=trace, model=model, wave=wave, flux=flux,
-        flux_err=flux_err if known_err else np.full_like(flux, np.nan),
+        trace=trace, model=model, spectrum=spec,
         line_names=list(line_names), fit_continuum=fit_continuum, line_centers=list(line_centers),
+        flux_unit=flux_unit
     )
 
 
@@ -363,6 +359,7 @@ def fit_lines_exact(
     """
     wave = np.asarray(wave, dtype=float)
     flux = np.asarray(flux, dtype=float)
+
     n_lines = len(line_names)
     line_centers = [get_wavelength(line) for line in line_names]
 
@@ -382,9 +379,6 @@ def fit_lines_exact(
     amp_guess = np.asarray(amp_guess, dtype=float)
     amp_guess = np.clip(amp_guess, 1e-6, None)
 
-    known_err = flux_err is not None
-    if known_err and np.isscalar(flux_err):
-        flux_err = np.full_like(flux, float(flux_err))
 
     wave0 = wave.mean()
     sigma_lo, sigma_hi = sigma_bounds
@@ -446,11 +440,7 @@ def fit_lines_exact(
 
         pm.Deterministic("model_flux", model_flux)
 
-        if known_err:
-            pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
-        else:
-            noise = pm.HalfNormal("noise", sigma=np.nanstd(flux))
-            pm.Normal("obs", mu=model_flux, sigma=noise, observed=flux)
+        pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
 
         trace = pm.sample(
             draws=draws, tune=tune, chains=chains, cores=cores,
@@ -460,6 +450,7 @@ def fit_lines_exact(
 
     return LineFitResult(
         trace=trace, model=model, wave=wave, flux=flux,
-        flux_err=flux_err if known_err else np.full_like(flux, np.nan),
+        flux_err=flux_err,
         line_names=list(line_names), fit_continuum=fit_continuum, line_centers=list(line_centers),
+        flux_unit=flux_unit
     )
