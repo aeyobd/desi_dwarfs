@@ -14,16 +14,133 @@ from .spectral_lines import get_wavelength
 from .spectrum import Spectrum
 
 
-
 @dataclass
-class LineFitResult:
-    trace: az.InferenceData
-    model: pm.Model
-    spectrum: Spectrum
-    line_names: list
-    line_centers: list
-    fit_continuum: bool
-    flux_unit: u.Quantity
+class LineFitter:
+    """
+    Fit `n = len(line_centers)` Gaussian emission lines simultaneously.
+
+    Parameters
+    ----------
+    line_names : list of str, optional
+        Labels for output (defaults to Line_0, Line_1, ...).
+    amp_guess : list of float, optional
+        Initial amplitude guesses (defaults to max(flux) near each line).
+    sigma_guess : lis
+    t of float or float, optional
+        Initial guess for line widths (defaults to ~3x median pixel spacing).
+    center_prior_width : float
+        Std dev (in wavelength units) of the Normal prior on each mu,
+        centered at the corresponding line_centers entry. Keep this tight
+        enough to prevent lines from swapping identities when blended.
+    sigma_bounds : (low, high)
+        Bounds used to build a bounded HalfNormal-like prior on sigma so it
+        can't collapse to 0 or blow up across the whole window.
+    fit_continuum : bool
+        If True, fit a small linear residual continuum (c0 + c1*(wave-wave0)).
+        draws, tune, chains, target_accept : PyMC sampling controls.
+
+    Returns
+    -------
+    LineFitResult
+    """
+
+    random_seed: int = 42
+    line_names: Sequence[str] | None = None
+    amp_guess: Sequence[float] | None = None
+    sigma_guess: Sequence[float] | float | None = None
+    center_prior_width: float = 3.0
+
+    sigma_bounds: tuple[float, float] = (0.3, 15.0)
+    fit_continuum: bool = True
+
+    draws: int = 2000
+    tune: int = 2000
+    chains: int = 4
+    cores: int = 1
+    target_accept: float = 0.9
+
+    exact_gaussian: bool = True
+
+
+    def fit(self, spec):
+        wave = spec.wavelength
+        flux = spec.flux
+        flux_err = spec.uncertainty
+        filt = np.isfinite(flux_err)
+
+        wave = wave[filt]
+        flux = flux[filt]
+        flux_err = flux_err[filt]
+
+        n_lines = len(self.line_names)
+        line_centers = [get_wavelength(line) * (1 + spec.redshift) for line in self.line_names]
+        self.line_centers = line_centers
+
+        dw = np.median(np.diff(np.sort(wave)))
+        
+        if self.sigma_guess is None:
+            sigma_guess = np.full(n_lines, 3 * dw)
+        elif np.isscalar(sigma_guess):
+            sigma_guess = np.full(n_lines, sigma_guess)
+        else:
+            sigma_guess = self.sigma_guess
+
+        sigma_guess = np.asarray(sigma_guess, dtype=float)
+
+        if self.amp_guess is None:
+            amp_guess = []
+            for c in line_centers:
+                mask = np.abs(wave - c) < 5 * dw
+                amp_guess.append(flux[mask].max() if mask.any() else flux.max())
+        else:
+            amp_guess = self.amp_guess
+        amp_guess = np.asarray(amp_guess, dtype=float)
+        amp_guess = np.clip(amp_guess, 1e-6, None)
+
+
+        wave0 = wave.mean()
+        sigma_lo, sigma_hi = self.sigma_bounds
+
+        with pm.Model() as model:
+            wave_data = pm.Data("wave_data", wave)
+
+            amp = pm.Normal("amp", sigma=amp_guess * 3, shape=n_lines,
+                                 initval=amp_guess)
+            mu = pm.Normal("mu", mu=line_centers, sigma=self.center_prior_width,
+                            shape=n_lines, initval=line_centers)
+            # Bounded width: HalfNormal truncated to [sigma_lo, sigma_hi]
+            sigma_raw = pm.HalfNormal("sigma_raw", sigma=sigma_guess, shape=n_lines,
+                                       initval=sigma_guess)
+            sigma = pm.Deterministic(
+                "sigma", pt.clip(sigma_raw, sigma_lo, sigma_hi)
+            )
+
+     
+            lines = amp[None, :] * pt.exp(
+                -0.5 * ((wave_data[:, None] - mu[None, :]) / sigma[None, :]) ** 2
+            )
+            model_flux = lines.sum(axis=1)
+
+            if self.fit_continuum:
+                c0 = pm.Normal("c0", mu=0.0, sigma=np.nanstd(flux))
+                c1 = pm.Normal("c1", mu=0.0, sigma=np.nanstd(flux) / max(np.ptp(wave), 1))
+                model_flux = model_flux + c0 + c1 * (wave_data - wave0)
+
+            pm.Deterministic("model_flux", model_flux)
+
+            pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
+
+            trace = pm.sample(
+                draws=self.draws, tune=self.tune, chains=self.chains, cores=self.cores,
+                target_accept=self.target_accept, random_seed=self.random_seed,
+                progressbar=True,
+            )
+
+        self.trace = trace
+        self.model = model
+        self.spectrum = spec
+
+        return self.summary()
 
     def summary(self, var_names=None):
         """Return an arviz summary table of the posterior."""
@@ -33,14 +150,14 @@ class LineFitResult:
             )
         return az.summary(self.trace, var_names=var_names)
 
-    def best_fit_curve(self, wave=None, hdi=True):
+    def best_fit_curve(self, wave=None, hdi=True, restframe=False):
         """
         Return the posterior-mean model spectrum (and optionally the 94% HDI)
         evaluated on `wave` (defaults to the fitted wavelength grid).
         """
 
         if wave is None:
-            wave = self.spectrum.wavelength.value
+            wave = self.spectrum.get_wavelength(restframe=restframe)
 
         posterior = self.trace.posterior
         if hasattr(posterior, "to_dataset"):
@@ -72,13 +189,13 @@ class LineFitResult:
         return mean, lo, hi
 
 
-    def plot_fit(self, ax=None, show_components=False):
+    def plot_fit(self, ax=None, show_components=False, restframe = False):
         if ax is None:
             fig, ax = plt.subplots(figsize=(9, 5))
 
-        wave = self.spectrum.wavelength.value
+        wave = self.spectrum.get_wavelength(restframe=restframe)
         ax.errorbar(
-            self.spectrum.wavelength, self.spectrum.flux / self.flux_unit, yerr=self.spectrum.uncertainty / self.flux_unit,
+            wave, self.spectrum.flux , yerr=self.spectrum.uncertainty,
             fmt=".", color="k", ms=12, label="data", zorder=2,
         )
 
@@ -110,13 +227,14 @@ class LineFitResult:
 
 
 
-    def plot_line_fit(self, line, ax=None, wave_range=30):
+    def plot_line_fit(self, line, ax=None, wave_range=30, restframe=False):
         if ax is None:
             fig, ax = plt.subplots(figsize=(9, 5))
 
         line_id = np.where(np.array(self.line_names) == line)[0][0]
         line_center = self.line_centers[line_id]
 
+        wave = self.spectrum.get_wavelength(restframe=restframe)
         filt = wave > line_center - wave_range
         filt &= wave < line_center + wave_range
         
@@ -126,8 +244,8 @@ class LineFitResult:
         )
 
         mean, lo, hi = self.best_fit_curve()
-        ax.plot(self.wave[filt], mean[filt], color="crimson", lw=2, label="total fit", zorder=1)
-        ax.fill_between(self.wave[filt], lo[filt], hi[filt], color="crimson", alpha=0.2, zorder=2)
+        ax.plot(wave[filt], mean[filt], color="crimson", lw=2, label="total fit", zorder=1)
+        ax.fill_between(wave[filt], lo[filt], hi[filt], color="crimson", alpha=0.2, zorder=2)
 
         posterior = self.trace.posterior
         if hasattr(posterior, "to_dataset"):
@@ -137,13 +255,13 @@ class LineFitResult:
         mu = post_mean["mu"].values
         sigma = post_mean["sigma"].values
         
-        comp = amp[line_id] * np.exp(-0.5 * ((self.wave - mu[line_id]) / sigma[line_id]) ** 2)
+        comp = amp[line_id] * np.exp(-0.5 * ((wave - mu[line_id]) / sigma[line_id]) ** 2)
         if self.fit_continuum:
             c0 = float(post_mean["c0"].values)
             c1 = float(post_mean["c1"].values)
-            wave0 = self.wave.mean()
-            comp = comp + c0 + c1 * (self.wave - wave0)
-        ax.plot(self.wave[filt], comp[filt], "--", lw=1.3, label=line, zorder=2)
+            wave0 = wave.mean()
+            comp = comp + c0 + c1 * (wave - wave0)
+        ax.plot(wave[filt], comp[filt], "--", lw=1.3, label=line, zorder=2)
 
         ax.set_xlabel("Wavelength")
         ax.set_ylabel("Flux")
@@ -187,121 +305,7 @@ class LineFitResult:
 
 
 
-def fit_lines(
-    spec: Spectrum,
-    flux_unit = 1e-17 * u.erg / u.cm**2 / u.s / u.Angstrom,
-    line_names: Sequence[str] | None = None,
-    amp_guess: Sequence[float] | None = None,
-    sigma_guess: Sequence[float] | float | None = None,
-    center_prior_width: float = 2.0,
-    sigma_bounds: tuple[float, float] = (0.3, 15.0),
-    fit_continuum: bool = True,
-    draws: int = 2000,
-    tune: int = 2000,
-    chains: int = 4,
-    cores: int = 1,
-    target_accept: float = 0.9,
-    random_seed: int = 42,
-    pixel_integrate: bool = True,
-) -> LineFitResult:
-    """
-    Fit `n = len(line_centers)` Gaussian emission lines simultaneously.
 
-    Parameters
-    ----------
-    spectrum: desi_utils.Spectrum
-        Continuum-subtracted spectrum.
-    line_centers : list of float
-        Initial guesses for each line's central wavelength.
-    line_names : list of str, optional
-        Labels for output (defaults to Line_0, Line_1, ...).
-    amp_guess : list of float, optional
-        Initial amplitude guesses (defaults to max(flux) near each line).
-    sigma_guess : lis
-    t of float or float, optional
-        Initial guess for line widths (defaults to ~3x median pixel spacing).
-    center_prior_width : float
-        Std dev (in wavelength units) of the Normal prior on each mu,
-        centered at the corresponding line_centers entry. Keep this tight
-        enough to prevent lines from swapping identities when blended.
-    sigma_bounds : (low, high)
-        Bounds used to build a bounded HalfNormal-like prior on sigma so it
-        can't collapse to 0 or blow up across the whole window.
-    fit_continuum : bool
-        If True, fit a small linear residual continuum (c0 + c1*(wave-wave0)).
-        draws, tune, chains, target_accept : PyMC sampling controls.
-
-    Returns
-    -------
-    LineFitResult
-    """
-    wave = np.asarray(spec.wavelength.to("Angstrom"), dtype=float)
-    flux = (spec.flux / flux_unit).decompose()
-    flux_err = (spec.uncertainty / flux_unit).decompose()
-
-    n_lines = len(line_names)
-    line_centers = [get_wavelength(line) * (1 + spec.redshift) for line in line_names]
-
-    dw = np.median(np.diff(np.sort(wave)))
-    
-    if sigma_guess is None:
-        sigma_guess = np.full(n_lines, 3 * dw)
-    elif np.isscalar(sigma_guess):
-        sigma_guess = np.full(n_lines, sigma_guess)
-    sigma_guess = np.asarray(sigma_guess, dtype=float)
-
-    if amp_guess is None:
-        amp_guess = []
-        for c in line_centers:
-            mask = np.abs(wave - c) < 5 * dw
-            amp_guess.append(flux[mask].max() if mask.any() else flux.max())
-    amp_guess = np.asarray(amp_guess, dtype=float)
-    amp_guess = np.clip(amp_guess, 1e-6, None)
-
-
-    wave0 = wave.mean()
-    sigma_lo, sigma_hi = sigma_bounds
-
-    with pm.Model() as model:
-        wave_data = pm.Data("wave_data", wave)
-
-        amp = pm.Normal("amp", sigma=amp_guess * 3, shape=n_lines,
-                             initval=amp_guess)
-        mu = pm.Normal("mu", mu=line_centers, sigma=center_prior_width,
-                        shape=n_lines, initval=line_centers)
-        # Bounded width: HalfNormal truncated to [sigma_lo, sigma_hi]
-        sigma_raw = pm.HalfNormal("sigma_raw", sigma=sigma_guess, shape=n_lines,
-                                   initval=sigma_guess)
-        sigma = pm.Deterministic(
-            "sigma", pt.clip(sigma_raw, sigma_lo, sigma_hi)
-        )
-
- 
-        lines = amp[None, :] * pt.exp(
-            -0.5 * ((wave_data[:, None] - mu[None, :]) / sigma[None, :]) ** 2
-        )
-        model_flux = lines.sum(axis=1)
-
-        if fit_continuum:
-            c0 = pm.Normal("c0", mu=0.0, sigma=np.nanstd(flux))
-            c1 = pm.Normal("c1", mu=0.0, sigma=np.nanstd(flux) / max(np.ptp(wave), 1))
-            model_flux = model_flux + c0 + c1 * (wave_data - wave0)
-
-        pm.Deterministic("model_flux", model_flux)
-
-        pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
-
-        trace = pm.sample(
-            draws=draws, tune=tune, chains=chains, cores=cores,
-            target_accept=target_accept, random_seed=random_seed,
-            progressbar=True,
-        )
-
-    return LineFitResult(
-        trace=trace, model=model, spectrum=spec,
-        line_names=list(line_names), fit_continuum=fit_continuum, line_centers=list(line_centers),
-        flux_unit=flux_unit
-    )
 
 
 
@@ -452,5 +456,4 @@ def fit_lines_exact(
         trace=trace, model=model, wave=wave, flux=flux,
         flux_err=flux_err,
         line_names=list(line_names), fit_continuum=fit_continuum, line_centers=list(line_centers),
-        flux_unit=flux_unit
     )

@@ -1,4 +1,5 @@
 import re
+import numpy as np
 import pyneb
 
 EMISSION_LINES = [
@@ -7,34 +8,34 @@ EMISSION_LINES = [
     'O2_3726A',
     'O2_3729A',
     'Ne3_3869A',
-    'Ne3_3967A',
+    'Ne3_3968A',
     'H1r_3970A',
-    'He1_4026A', 
+    'He1r_4026A', 
     'H1r_4102A',
-    'H1r_4340A', 
+    'H1r_4341A', 
     'O3_4363A',
-    'He1_4471A', 
-    'He2_4686A', 
+    'He1r_4471A', 
+    'He2r_4686A', 
     'H1r_4861A',
     'O3_4959A',
     'O3_5007A',
     'N2_5755A',
-    'He1_5876A', 
+    'He1r_5876A', 
     'O1_6300A', 
     'S3_6312A',
     'N2_6548A',
     'H1r_6563A',  
-    'N2_6583A',
+    'N2_6584A',
     'S2_6716A', 
     'S2_6731A',  
-    'He1_7065A',
+    'He1r_7065A',
     'Ar3_7136A',
-    'He1_7281A',
+    'He1r_7281A',
     'O2_7320A', 
     'O2_7331A',
     'Ar3_7751A',
     'S3_9071A', 
-    'S3_9533A',
+    'S3_9531A',
 ]
 
 
@@ -64,7 +65,35 @@ def get_line_element(emline):
     return emline.split("_")[0]
 
 
-def get_wavelength(emline):
+def get_wavelength(emline, *, vacuum=True, wavetol=0.003):
+    line = get_pyneb_line(emline)
+    if "He" in emline:
+        return get_named_wavelength(emline)
+
+    if is_recomb_line(line):
+        atom = pyneb.RecAtom(line.elem, line.spec)
+    else:
+        atom = pyneb.Atom(line.elem, line.spec)
+
+    i, j = atom.getTransition(line.wave)
+    Ei = atom.getEnergy(i)
+
+    Ej = atom.getEnergy(j)
+    assert Ei > Ej
+    wave = 1 / (Ei - Ej)
+    assert np.abs(1 - wave / line.wave) < wavetol
+
+    if not vacuum:
+        wave = pyneb.utils.physics.vactoair(wave)
+
+
+    return wave
+
+def is_recomb_line(line):
+    return line.atom.endswith("r")
+
+
+def get_named_wavelength(emline):
     if get_line_element(emline) == "h":
         return  balmer_line_wavelengths[emline]
         
@@ -103,15 +132,7 @@ def to_elsm_format(emline):
 
 
 def get_pyneb_line(emline: str):
-    if emline in balmer_line_wavelengths.keys():
-        wave = get_named_wavelength(emline)
-        Ha = pyneb.EmissionLine(label=f"H1r_{wave}A")
-
-    ele = get_line_element(emline).title()
-    wave = get_line_named_wavelength(emline)
-    spec = roman_num_to_int(get_species(emline))
-
-    return pyneb.EmissionLine(ele, spec, wave)
+    return pyneb.EmissionLine(label=emline)
 
 
 

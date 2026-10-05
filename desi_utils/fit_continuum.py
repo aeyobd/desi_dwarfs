@@ -91,7 +91,7 @@ class SEDModel:
 
         ic = self.get_ic(spectrum.redshift)
 
-        uncertainty = copy(spectrum.uncertainty.value)
+        uncertainty = copy(spectrum.uncertainty)
         uncertainty[~np.isfinite(uncertainty)] = 1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
         uncertainty[uncertainty == 0] =  1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
 
