@@ -1,459 +1,475 @@
+"""Bayesian fitting of (possibly blended) Gaussian emission lines with PyMC.
+
+Typical use
+-----------
+>>> fitter = LineFitter(line_names=["H1r_4683A", "O3_5007A"])
+>>> result = fitter.fit(spec)
+>>> result.summary()
+>>> result.line_fluxes()
+>>> result.plot_fit(show_components=True)
+
+`LineFitter` holds only configuration and is immutable, so one instance can
+be reused on many spectra. All fit products (trace, data, plotting, derived
+quantities) live on the returned `LineFitResult`.
+"""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Sequence
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Callable, Sequence
 
-from astropy import units as u
-import numpy as np
+import arviz as az
 import matplotlib.pyplot as plt
+import numpy as np
 import pymc as pm
 import pytensor.tensor as pt
-import arviz as az
+from scipy.special import erf as np_erf
 
 from .spectral_lines import get_wavelength
-from .spectrum import Spectrum
+
+if TYPE_CHECKING:
+    from matplotlib.axes import Axes
+
+    from .spectrum import Spectrum
 
 
-@dataclass
-class LineFitter:
+_SQRT2 = np.sqrt(2.0)
+_SQRT_HALF_PI = np.sqrt(np.pi / 2.0)
+_SQRT_2PI = np.sqrt(2.0 * np.pi)
+
+
+# --------------------------------------------------------------------------
+# Pure helpers (shared by the PyMC model and the numpy post-processing so the
+# two can never drift apart).
+# --------------------------------------------------------------------------
+def _pixel_edges(wave: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Lower/upper pixel edges: midpoints between samples, ends extrapolated.
+
+    Works for non-uniform grids (e.g. log-lambda) as long as `wave` is
+    strictly ascending.
     """
-    Fit `n = len(line_centers)` Gaussian emission lines simultaneously.
+    if wave.size < 2:
+        raise ValueError("Need at least two wavelength samples.")
+    if np.any(np.diff(wave) <= 0):
+        raise ValueError("`wave` must be strictly ascending.")
+    mid = 0.5 * (wave[:-1] + wave[1:])
+    edges = np.concatenate(([2 * wave[0] - mid[0]], mid, [2 * wave[-1] - mid[-1]]))
+    return edges[:-1], edges[1:]
+
+
+def _gaussian_flux(
+    x,
+    amp,
+    mu,
+    sigma,
+    *,
+    edges: tuple | None,
+    exp: Callable,
+    erf: Callable,
+):
+    """Gaussian flux density, all arguments pre-broadcast by the caller.
+
+    If `edges` is None the Gaussian is evaluated at `x`. Otherwise it is
+    averaged analytically over each pixel [lo, hi] using the error function,
+    which conserves line flux even when a line spans only a few pixels.
+    """
+    if edges is None:
+        return amp * exp(-0.5 * ((x - mu) / sigma) ** 2)
+    lo, hi = edges
+    s2 = sigma * _SQRT2
+    integral = amp * sigma * _SQRT_HALF_PI * (erf((hi - mu) / s2) - erf((lo - mu) / s2))
+    return integral / (hi - lo)
+
+
+def _per_line(value, n: int, name: str) -> np.ndarray:
+    """Broadcast a scalar or length-n sequence to a float array of length n."""
+    arr = np.asarray(value, dtype=float)
+    if arr.ndim == 0:
+        return np.full(n, float(arr))
+    if arr.shape != (n,):
+        raise ValueError(f"`{name}` must be a scalar or have length {n}, got shape {arr.shape}.")
+    return arr
+
+
+# --------------------------------------------------------------------------
+# LineFitter
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, kw_only=True)
+class LineFitter:
+    """Fit `len(line_names)` Gaussian emission lines simultaneously.
 
     Parameters
     ----------
-    line_names : list of str, optional
-        Labels for output (defaults to Line_0, Line_1, ...).
-    amp_guess : list of float, optional
-        Initial amplitude guesses (defaults to max(flux) near each line).
-    sigma_guess : lis
-    t of float or float, optional
-        Initial guess for line widths (defaults to ~3x median pixel spacing).
+    line_names : sequence of str
+        Lines to fit; rest wavelengths come from `get_wavelength(name)` and
+        are shifted by the spectrum's redshift.
+    amp_guess : float or sequence of float, optional
+        Initial amplitudes (default: max flux within 5 pixels of each line).
+    sigma_guess : float or sequence of float, optional
+        Initial line widths (default: 3x median pixel spacing).
     center_prior_width : float
-        Std dev (in wavelength units) of the Normal prior on each mu,
-        centered at the corresponding line_centers entry. Keep this tight
-        enough to prevent lines from swapping identities when blended.
+        Std dev (wavelength units) of the Normal prior on each line centre.
+        Keep it tight enough that blended lines cannot swap identities.
     sigma_bounds : (low, high)
-        Bounds used to build a bounded HalfNormal-like prior on sigma so it
-        can't collapse to 0 or blow up across the whole window.
+        Line widths get a HalfNormal prior truncated to this range.
     fit_continuum : bool
-        If True, fit a small linear residual continuum (c0 + c1*(wave-wave0)).
-        draws, tune, chains, target_accept : PyMC sampling controls.
-
-    Returns
-    -------
-    LineFitResult
+        Fit a linear residual continuum c0 + c1 * (wave - wave0).
+    exact_gaussian : bool
+        Average the Gaussian analytically over each pixel (erf) instead of
+        evaluating it at pixel centres. Requires ascending wavelengths.
+    draws, tune, chains, cores, target_accept, random_seed, progressbar :
+        PyMC sampling controls.
     """
 
-    random_seed: int = 42
-    line_names: Sequence[str] | None = None
-    amp_guess: Sequence[float] | None = None
+    line_names: Sequence[str]
+    amp_guess: Sequence[float] | float | None = None
     sigma_guess: Sequence[float] | float | None = None
     center_prior_width: float = 3.0
-
     sigma_bounds: tuple[float, float] = (0.3, 15.0)
     fit_continuum: bool = True
+    exact_gaussian: bool = True
 
     draws: int = 2000
     tune: int = 2000
     chains: int = 4
     cores: int = 1
     target_accept: float = 0.9
+    random_seed: int = 42
+    progressbar: bool = True
 
-    exact_gaussian: bool = True
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "line_names", tuple(self.line_names))
+        if not self.line_names:
+            raise ValueError("`line_names` must not be empty.")
+        lo, hi = self.sigma_bounds
+        if not 0 < lo < hi:
+            raise ValueError("`sigma_bounds` must satisfy 0 < low < high.")
+        if self.center_prior_width <= 0:
+            raise ValueError("`center_prior_width` must be positive.")
 
+    # ---- public API -------------------------------------------------------
+    def fit(self, spec: Spectrum) -> LineFitResult:
+        """Fit a `Spectrum` (uses its flux, uncertainty and redshift)."""
+        return self.fit_arrays(
+            spec.wavelength, spec.flux, spec.uncertainty, redshift=spec.redshift
+        )
 
-    def fit(self, spec):
-        wave = spec.wavelength
-        flux = spec.flux
-        flux_err = spec.uncertainty
-        filt = np.isfinite(flux_err)
+    def fit_arrays(
+        self,
+        wave,
+        flux,
+        flux_err=None,
+        *,
+        redshift: float = 0.0,
+    ) -> LineFitResult:
+        """Fit raw arrays.
 
-        wave = wave[filt]
-        flux = flux[filt]
-        flux_err = flux_err[filt]
-
+        `flux_err` may be an array, a scalar, or None (a single noise scale
+        is then inferred from the data).
+        """
+        wave, flux, flux_err = self._clean_data(wave, flux, flux_err)
         n_lines = len(self.line_names)
-        line_centers = [get_wavelength(line) * (1 + spec.redshift) for line in self.line_names]
-        self.line_centers = line_centers
+        centers = np.array([get_wavelength(n) for n in self.line_names]) * (1.0 + redshift)
+        amp0, sigma0 = self._initial_guesses(wave, flux, centers)
+        wave0 = float(wave.mean())
 
-        dw = np.median(np.diff(np.sort(wave)))
-        
+        model = self._build_model(wave, flux, flux_err, centers, amp0, sigma0, wave0)
+        with model:
+            trace = pm.sample(
+                draws=self.draws,
+                tune=self.tune,
+                chains=self.chains,
+                cores=self.cores,
+                target_accept=self.target_accept,
+                random_seed=self.random_seed,
+                progressbar=self.progressbar,
+            )
+
+        return LineFitResult(
+            trace=trace,
+            model=model,
+            wave=wave,
+            flux=flux,
+            flux_err=flux_err,
+            line_names=self.line_names,
+            line_centers=tuple(float(c) for c in centers),
+            redshift=float(redshift),
+            wave0=wave0,
+            fit_continuum=self.fit_continuum,
+            exact_gaussian=self.exact_gaussian,
+        )
+
+    # ---- internals --------------------------------------------------------
+    @staticmethod
+    def _clean_data(wave, flux, flux_err):
+        wave = np.asarray(wave, dtype=float)
+        flux = np.asarray(flux, dtype=float)
+        good = np.isfinite(wave) & np.isfinite(flux)
+        if flux_err is not None:
+            flux_err = np.broadcast_to(np.asarray(flux_err, dtype=float), flux.shape)
+            good &= np.isfinite(flux_err) & (flux_err > 0)
+        wave, flux = wave[good], flux[good]
+        flux_err = None if flux_err is None else flux_err[good]
+
+        order = np.argsort(wave)
+        wave, flux = wave[order], flux[order]
+        flux_err = None if flux_err is None else flux_err[order]
+        if wave.size < 2:
+            raise ValueError("Fewer than two usable pixels after removing non-finite values.")
+        return wave, flux, flux_err
+
+    def _initial_guesses(self, wave, flux, centers):
+        n = len(self.line_names)
+        dw = np.median(np.diff(wave))
+
         if self.sigma_guess is None:
-            sigma_guess = np.full(n_lines, 3 * dw)
-        elif np.isscalar(sigma_guess):
-            sigma_guess = np.full(n_lines, sigma_guess)
+            sigma0 = np.full(n, 3.0 * dw)
         else:
-            sigma_guess = self.sigma_guess
-
-        sigma_guess = np.asarray(sigma_guess, dtype=float)
+            sigma0 = _per_line(self.sigma_guess, n, "sigma_guess")
 
         if self.amp_guess is None:
-            amp_guess = []
-            for c in line_centers:
-                mask = np.abs(wave - c) < 5 * dw
-                amp_guess.append(flux[mask].max() if mask.any() else flux.max())
+            amp0 = np.array(
+                [
+                    flux[m].max() if (m := np.abs(wave - c) < 5 * dw).any() else flux.max()
+                    for c in centers
+                ]
+            )
         else:
-            amp_guess = self.amp_guess
-        amp_guess = np.asarray(amp_guess, dtype=float)
-        amp_guess = np.clip(amp_guess, 1e-6, None)
+            amp0 = _per_line(self.amp_guess, n, "amp_guess")
+        return np.clip(amp0, 1e-6, None), sigma0
 
-
-        wave0 = wave.mean()
+    def _build_model(self, wave, flux, flux_err, centers, amp0, sigma0, wave0) -> pm.Model:
         sigma_lo, sigma_hi = self.sigma_bounds
+        flux_std = float(np.nanstd(flux)) or 1.0
+        wave_span = float(np.ptp(wave))
+        edges = None
+        if self.exact_gaussian:
+            edges = tuple(e[:, None] for e in _pixel_edges(wave))
 
-        with pm.Model() as model:
-            wave_data = pm.Data("wave_data", wave)
-
-            amp = pm.Normal("amp", sigma=amp_guess * 3, shape=n_lines,
-                                 initval=amp_guess)
-            mu = pm.Normal("mu", mu=line_centers, sigma=self.center_prior_width,
-                            shape=n_lines, initval=line_centers)
-            # Bounded width: HalfNormal truncated to [sigma_lo, sigma_hi]
-            sigma_raw = pm.HalfNormal("sigma_raw", sigma=sigma_guess, shape=n_lines,
-                                       initval=sigma_guess)
-            sigma = pm.Deterministic(
-                "sigma", pt.clip(sigma_raw, sigma_lo, sigma_hi)
+        with pm.Model(coords={"line": list(self.line_names)}) as model:
+            amp = pm.Normal("amp", mu=0.0, sigma=3.0 * amp0, dims="line", initval=amp0)
+            mu = pm.Normal(
+                "mu", mu=centers, sigma=self.center_prior_width, dims="line", initval=centers
+            )
+            # HalfNormal truncated to the allowed range. (Clipping instead
+            # would give the sampler zero gradient outside the bounds.)
+            sigma = pm.Truncated(
+                "sigma",
+                pm.HalfNormal.dist(sigma=sigma0),
+                lower=sigma_lo,
+                upper=sigma_hi,
+                dims="line",
+                initval=np.clip(sigma0, sigma_lo, sigma_hi),
             )
 
-     
-            lines = amp[None, :] * pt.exp(
-                -0.5 * ((wave_data[:, None] - mu[None, :]) / sigma[None, :]) ** 2
+            profiles = _gaussian_flux(
+                wave[:, None], amp[None, :], mu[None, :], sigma[None, :],
+                edges=edges, exp=pt.exp, erf=pt.erf,
             )
-            model_flux = lines.sum(axis=1)
+            model_flux = profiles.sum(axis=1)
 
             if self.fit_continuum:
-                c0 = pm.Normal("c0", mu=0.0, sigma=np.nanstd(flux))
-                c1 = pm.Normal("c1", mu=0.0, sigma=np.nanstd(flux) / max(np.ptp(wave), 1))
-                model_flux = model_flux + c0 + c1 * (wave_data - wave0)
+                c0 = pm.Normal("c0", mu=0.0, sigma=flux_std)
+                c1 = pm.Normal("c1", mu=0.0, sigma=flux_std / wave_span)
+                model_flux = model_flux + c0 + c1 * (wave - wave0)
 
-            pm.Deterministic("model_flux", model_flux)
+            pm.Deterministic("line_flux", amp * sigma * _SQRT_2PI, dims="line")
 
-            pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
+            noise = flux_err if flux_err is not None else pm.HalfNormal("flux_scale", sigma=flux_std)
+            pm.Normal("obs", mu=model_flux, sigma=noise, observed=flux)
+        return model
 
-            trace = pm.sample(
-                draws=self.draws, tune=self.tune, chains=self.chains, cores=self.cores,
-                target_accept=self.target_accept, random_seed=self.random_seed,
-                progressbar=True,
-            )
 
-        self.trace = trace
-        self.model = model
-        self.spectrum = spec
+# --------------------------------------------------------------------------
+# LineFitResult
+# --------------------------------------------------------------------------
+@dataclass(frozen=True, eq=False)
+class LineFitResult:
+    """Posterior and data from a `LineFitter` run, with plotting helpers.
 
-        return self.summary()
+    All wavelengths stored here are in the observed frame. `restframe=True`
+    on plotting methods divides by (1 + redshift) for display only.
+    """
 
-    def summary(self, var_names=None):
-        """Return an arviz summary table of the posterior."""
-        if var_names is None:
-            var_names = ["amp", "mu", "sigma"] + (
-                ["c0", "c1"] if self.fit_continuum else []
-            )
-        return az.summary(self.trace, var_names=var_names)
+    trace: az.InferenceData
+    model: pm.Model
+    wave: np.ndarray
+    flux: np.ndarray
+    flux_err: np.ndarray | None
+    line_names: tuple[str, ...]
+    line_centers: tuple[float, ...]  # observed frame
+    redshift: float
+    wave0: float  # reference wavelength of the linear continuum
+    fit_continuum: bool
+    exact_gaussian: bool
 
-    def best_fit_curve(self, wave=None, hdi=True, restframe=False):
-        """
-        Return the posterior-mean model spectrum (and optionally the 94% HDI)
-        evaluated on `wave` (defaults to the fitted wavelength grid).
-        """
+    # ---- posterior access ------------------------------------------------
+    def _posterior(self):
+        post = self.trace.posterior
+        return post.to_dataset() if hasattr(post, "to_dataset") else post
 
-        if wave is None:
-            wave = self.spectrum.get_wavelength(restframe=restframe)
-
-        posterior = self.trace.posterior
-        if hasattr(posterior, "to_dataset"):
-            posterior = posterior.to_dataset()
-        post = posterior.stack(sample=("chain", "draw"))
-        amp = post["amp"].values      # (n_lines, n_samples)
-        mu = post["mu"].values
-        sigma = post["sigma"].values
-        n_lines, n_samples = amp.shape
-
-        w = wave[:, None, None]                       # (n_wave,1,1)
-        a = amp[None, :, :]                            # (1,n_lines,n_samples)
-        m = mu[None, :, :]
-        s = sigma[None, :, :]
-        lines = a * np.exp(-0.5 * ((w - m) / s) ** 2)  # (n_wave,n_lines,n_samples)
-        model_samples = lines.sum(axis=1)              # (n_wave, n_samples)
-
+    def _samples(self, max_samples: int | None) -> dict[str, np.ndarray]:
+        """Posterior draws as arrays: line params (L, S), continuum (S,)."""
+        post = self._posterior().stack(sample=("chain", "draw"))
+        n = post.sizes["sample"]
+        if max_samples is not None and n > max_samples:
+            post = post.isel(sample=np.linspace(0, n - 1, max_samples).astype(int))
+        out = {k: post[k].transpose("line", "sample").values for k in ("amp", "mu", "sigma")}
         if self.fit_continuum:
-            c0 = post["c0"].values[None, :]
-            c1 = post["c1"].values[None, :]
-            wave0 = wave.mean()
-            model_samples = model_samples + c0 + c1 * (w[:, 0, :] - wave0)
+            out["c0"] = post["c0"].values
+            out["c1"] = post["c1"].values
+        return out
 
-        mean = model_samples.mean(axis=1)
-        if not hdi:
+    def _means(self) -> dict[str, np.ndarray]:
+        """Posterior means in the same layout as `_samples` with S = 1."""
+        post = self._posterior().mean(dim=("chain", "draw"))
+        out = {k: post[k].values[:, None] for k in ("amp", "mu", "sigma")}
+        if self.fit_continuum:
+            out["c0"] = np.atleast_1d(post["c0"].values)
+            out["c1"] = np.atleast_1d(post["c1"].values)
+        return out
+
+    # ---- model evaluation ------------------------------------------------
+    def _evaluate(
+        self, wave: np.ndarray, params: dict[str, np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Return per-line profiles (n_wave, L, S) and continuum (n_wave, S)."""
+        edges = None
+        if self.exact_gaussian:
+            edges = tuple(e[:, None, None] for e in _pixel_edges(wave))
+        comps = _gaussian_flux(
+            wave[:, None, None],
+            params["amp"][None],
+            params["mu"][None],
+            params["sigma"][None],
+            edges=edges,
+            exp=np.exp,
+            erf=np_erf,
+        )
+        n_samples = comps.shape[2]
+        if self.fit_continuum:
+            cont = params["c0"][None, :] + params["c1"][None, :] * (wave[:, None] - self.wave0)
+        else:
+            cont = np.zeros((wave.size, n_samples))
+        return comps, cont
+
+    def best_fit_curve(
+        self,
+        wave: np.ndarray | None = None,
+        interval: float | None = 0.94,
+        max_samples: int | None = 1000,
+    ):
+        """Posterior-mean model and an equal-tailed credible interval.
+
+        Parameters
+        ----------
+        wave : observed-frame wavelengths (ascending); defaults to the fit grid.
+        interval : credible mass (e.g. 0.94), or None to skip the interval.
+        max_samples : evenly thin the posterior to this many draws to bound
+            memory (n_wave x n_lines x n_draws floats). None uses all draws.
+
+        Returns
+        -------
+        mean, lo, hi : arrays (lo/hi are None if `interval` is None)
+        """
+        wave = self.wave if wave is None else np.asarray(wave, dtype=float)
+        comps, cont = self._evaluate(wave, self._samples(max_samples))
+        model = comps.sum(axis=1) + cont  # (n_wave, S)
+        mean = model.mean(axis=1)
+        if interval is None:
             return mean, None, None
-        lo = np.percentile(model_samples, 3, axis=1)
-        hi = np.percentile(model_samples, 97, axis=1)
+        tail = 50.0 * (1.0 - interval)
+        lo, hi = np.percentile(model, [tail, 100.0 - tail], axis=1)
         return mean, lo, hi
 
-
-    def plot_fit(self, ax=None, show_components=False, restframe = False):
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(9, 5))
-
-        wave = self.spectrum.get_wavelength(restframe=restframe)
-        ax.errorbar(
-            wave, self.spectrum.flux , yerr=self.spectrum.uncertainty,
-            fmt=".", color="k", ms=12, label="data", zorder=2,
-        )
-
-        mean, lo, hi = self.best_fit_curve()
-        ax.plot(wave, mean, color="crimson", lw=2, label="total fit", zorder=3)
-        ax.fill_between(wave, lo, hi, color="crimson", alpha=0.2, zorder=2)
-
-        if show_components:
-            posterior = self.trace.posterior
-            if hasattr(posterior, "to_dataset"):
-                posterior = posterior.to_dataset()
-            post_mean = posterior.mean(dim=("chain", "draw"))
-            amp = post_mean["amp"].values
-            mu = post_mean["mu"].values
-            sigma = post_mean["sigma"].values
-            for i, name in enumerate(self.line_names):
-                comp = amp[i] * np.exp(-0.5 * ((wave - mu[i]) / sigma[i]) ** 2)
-                if self.fit_continuum:
-                    c0 = float(post_mean["c0"].values)
-                    c1 = float(post_mean["c1"].values)
-                    wave0 = wave.mean()
-                    comp = comp + c0 + c1 * (wave - wave0)
-                ax.plot(wave, comp, "--", lw=1.3, label=name, zorder=1)
-
-        ax.set_xlabel("Wavelength")
-        ax.set_ylabel("Flux")
-        ax.legend(fontsize=8)
-        return ax
-
-
-
-    def plot_line_fit(self, line, ax=None, wave_range=30, restframe=False):
-        if ax is None:
-            fig, ax = plt.subplots(figsize=(9, 5))
-
-        line_id = np.where(np.array(self.line_names) == line)[0][0]
-        line_center = self.line_centers[line_id]
-
-        wave = self.spectrum.get_wavelength(restframe=restframe)
-        filt = wave > line_center - wave_range
-        filt &= wave < line_center + wave_range
-        
-        ax.errorbar(
-            wave[filt], self.spectrum.flux[filt], yerr=self.spectrum.uncertainty[filt],
-            fmt=".", color="k", ms=12, alpha=1, label="data", zorder=3,
-        )
-
-        mean, lo, hi = self.best_fit_curve()
-        ax.plot(wave[filt], mean[filt], color="crimson", lw=2, label="total fit", zorder=1)
-        ax.fill_between(wave[filt], lo[filt], hi[filt], color="crimson", alpha=0.2, zorder=2)
-
-        posterior = self.trace.posterior
-        if hasattr(posterior, "to_dataset"):
-            posterior = posterior.to_dataset()
-        post_mean = posterior.mean(dim=("chain", "draw"))
-        amp = post_mean["amp"].values
-        mu = post_mean["mu"].values
-        sigma = post_mean["sigma"].values
-        
-        comp = amp[line_id] * np.exp(-0.5 * ((wave - mu[line_id]) / sigma[line_id]) ** 2)
-        if self.fit_continuum:
-            c0 = float(post_mean["c0"].values)
-            c1 = float(post_mean["c1"].values)
-            wave0 = wave.mean()
-            comp = comp + c0 + c1 * (wave - wave0)
-        ax.plot(wave[filt], comp[filt], "--", lw=1.3, label=line, zorder=2)
-
-        ax.set_xlabel("Wavelength")
-        ax.set_ylabel("Flux")
-        ax.legend(fontsize=8)
-        
-        return ax
-
-
-    
-    def plot_corner(self, var_names=None):
+    # ---- tabular summaries -----------------------------------------------
+    def summary(self, var_names: Sequence[str] | None = None):
+        """ArviZ summary table of the posterior."""
         if var_names is None:
-            var_names = ["amp", "mu", "sigma"]
-        return az.plot_pair(
-            self.trace, var_names=var_names, kind="kde",
-            marginals=True, figsize=(9, 9),
-        )
+            var_names = ["amp", "mu", "sigma", "line_flux"]
+            if self.fit_continuum:
+                var_names += ["c0", "c1"]
+        return az.summary(self.trace, var_names=list(var_names))
 
     def line_fluxes(self):
-        """
-        Integrated flux of each Gaussian line: A * sigma * sqrt(2*pi),
-        with uncertainty, computed from the posterior samples.
-        """
-        post = self.trace.posterior
-        if hasattr(post, "to_dataset"):
-            post = post.to_dataset()
-        # amp and sigma are separate RVs with independent xarray dims even
-        # though they share a shape, so multiply on the underlying arrays
-        # (chain, draw, line) rather than via xarray broadcasting.
-        amp_vals = post["amp"].values
-        sigma_vals = post["sigma"].values
-        integrated_vals = amp_vals * sigma_vals * np.sqrt(2 * np.pi)
+        """Integrated flux per line, amp * sigma * sqrt(2 pi), from the posterior."""
+        return az.summary(self.trace, var_names=["line_flux"])
 
-        integrated = post["amp"].copy(data=integrated_vals)
-        integrated = integrated.rename("integrated_flux").rename(
-            {"amp_dim_0": "line"}
+    # ---- plotting --------------------------------------------------------
+    def _x(self, wave: np.ndarray, restframe: bool) -> np.ndarray:
+        # Assumes rest = observed / (1 + z), the usual convention.
+        return wave / (1.0 + self.redshift) if restframe else wave
+
+    @staticmethod
+    def _get_ax(ax: Axes | None) -> Axes:
+        return plt.subplots(figsize=(9, 5))[1] if ax is None else ax
+
+    def _plot_data_and_fit(self, ax, mask, restframe, components, interval):
+        x = self._x(self.wave, restframe)
+        ax.errorbar(
+            x[mask], self.flux[mask],
+            yerr=None if self.flux_err is None else self.flux_err[mask],
+            fmt=".", color="k", ms=12, label="data", zorder=3,
         )
-        integrated = integrated.assign_coords(line=self.line_names)
-        summ = az.summary(integrated)
-        return summ
+        mean, lo, hi = self.best_fit_curve(interval=interval)
+        ax.plot(x[mask], mean[mask], color="crimson", lw=2, label="total fit", zorder=2)
+        if lo is not None:
+            ax.fill_between(x[mask], lo[mask], hi[mask], color="crimson", alpha=0.2, zorder=1)
+        for name, comp in components:
+            ax.plot(x[mask], comp[mask], "--", lw=1.3, label=name, zorder=2)
+        ax.set_xlabel("Rest wavelength" if restframe else "Wavelength")
+        ax.set_ylabel("Flux")
+        ax.legend(fontsize=8)
 
+    def _mean_components(self, indices: Sequence[int]):
+        comps, cont = self._evaluate(self.wave, self._means())
+        return [(self.line_names[i], comps[:, i, 0] + cont[:, 0]) for i in indices]
 
+    def plot_fit(
+        self,
+        ax: Axes | None = None,
+        show_components: bool = False,
+        restframe: bool = False,
+        interval: float | None = 0.94,
+    ) -> Axes:
+        ax = self._get_ax(ax)
+        components = (
+            self._mean_components(range(len(self.line_names))) if show_components else []
+        )
+        self._plot_data_and_fit(
+            ax, np.ones(self.wave.size, dtype=bool), restframe, components, interval
+        )
+        return ax
 
+    def plot_line_fit(
+        self,
+        line: str,
+        ax: Axes | None = None,
+        wave_range: float = 30.0,
+        restframe: bool = False,
+        interval: float | None = 0.94,
+    ) -> Axes:
+        """Zoom on one line; `wave_range` is in the displayed frame."""
+        if line not in self.line_names:
+            raise ValueError(f"Unknown line {line!r}; fitted lines: {list(self.line_names)}")
+        idx = self.line_names.index(line)
+        ax = self._get_ax(ax)
+        center = float(self._x(np.asarray(self.line_centers[idx]), restframe))
+        x = self._x(self.wave, restframe)
+        mask = np.abs(x - center) < wave_range
+        self._plot_data_and_fit(ax, mask, restframe, self._mean_components([idx]), interval)
+        return ax
 
-
-
-
-
-
-def fit_lines_exact(
-    wave: np.ndarray,
-    flux: np.ndarray,
-    flux_err: np.ndarray | float | None,
-    line_names: Sequence[str] | None = None,
-    amp_guess: Sequence[float] | None = None,
-    sigma_guess: Sequence[float] | float | None = None,
-    center_prior_width: float = 2.0,
-    sigma_bounds: tuple[float, float] = (0.3, 15.0),
-    fit_continuum: bool = True,
-    draws: int = 2000,
-    tune: int = 2000,
-    chains: int = 4,
-    cores: int = 1,
-    target_accept: float = 0.9,
-    random_seed: int = 42,
-) -> LineFitResult:
-    """
-    Fit `n = len(line_centers)` Gaussian emission lines simultaneously.
-
-    Parameters
-    ----------
-    wave, flux : 1D arrays
-        Continuum-subtracted spectrum (same units for wave as line_centers).
-    flux_err : 1D array, scalar, or None
-        Per-pixel flux uncertainty. If None, a single noise scale is fit
-        from the data (HalfNormal prior).
-    line_centers : list of float
-        Initial guesses for each line's central wavelength.
-    line_names : list of str, optional
-        Labels for output (defaults to Line_0, Line_1, ...).
-    amp_guess : list of float, optional
-        Initial amplitude guesses (defaults to max(flux) near each line).
-    sigma_guess : lis
-    t of float or float, optional
-        Initial guess for line widths (defaults to ~3x median pixel spacing).
-    center_prior_width : float
-        Std dev (in wavelength units) of the Normal prior on each mu,
-        centered at the corresponding line_centers entry. Keep this tight
-        enough to prevent lines from swapping identities when blended.
-    sigma_bounds : (low, high)
-        Bounds used to build a bounded HalfNormal-like prior on sigma so it
-        can't collapse to 0 or blow up across the whole window.
-    fit_continuum : bool
-        If True, fit a small linear residual continuum (c0 + c1*(wave-wave0)).
-        draws, tune, chains, target_accept : PyMC sampling controls.
-
-    Returns
-    -------
-    LineFitResult
-    """
-    wave = np.asarray(wave, dtype=float)
-    flux = np.asarray(flux, dtype=float)
-
-    n_lines = len(line_names)
-    line_centers = [get_wavelength(line) for line in line_names]
-
-    dw = np.median(np.diff(np.sort(wave)))
-    
-    if sigma_guess is None:
-        sigma_guess = np.full(n_lines, 3 * dw)
-    elif np.isscalar(sigma_guess):
-        sigma_guess = np.full(n_lines, sigma_guess)
-    sigma_guess = np.asarray(sigma_guess, dtype=float)
-
-    if amp_guess is None:
-        amp_guess = []
-        for c in line_centers:
-            mask = np.abs(wave - c) < 5 * dw
-            amp_guess.append(flux[mask].max() if mask.any() else flux.max())
-    amp_guess = np.asarray(amp_guess, dtype=float)
-    amp_guess = np.clip(amp_guess, 1e-6, None)
-
-
-    wave0 = wave.mean()
-    sigma_lo, sigma_hi = sigma_bounds
-
-
-    # Pixel edges = midpoints between neighboring samples, with the
-    # two end pixels extrapolated symmetrically. Works for non-uniform
-    # (e.g. log-lambda) grids too, as long as wave is sorted.
-    order = np.argsort(wave)
-    if not np.array_equal(order, np.arange(len(wave))):
-        raise ValueError("`wave` must be sorted ascending for pixel_integrate=True")
-    mid = 0.5 * (wave[:-1] + wave[1:])
-    first_edge = wave[0] - (mid[0] - wave[0])
-    last_edge = wave[-1] + (wave[-1] - mid[-1])
-    edges = np.concatenate(([first_edge], mid, [last_edge]))
-    pix_lo = edges[:-1]
-    pix_hi = edges[1:]
-    pix_dw = pix_hi - pix_lo
-
-
-    with pm.Model() as model:
-        wave_data = pm.Data("wave_data", wave)
-
-        amp = pm.Normal("amp", sigma=amp_guess * 3, shape=n_lines,
-                             initval=amp_guess)
-        mu = pm.Normal("mu", mu=line_centers, sigma=center_prior_width,
-                        shape=n_lines, initval=line_centers)
-        # Bounded width: HalfNormal truncated to [sigma_lo, sigma_hi]
-        sigma_raw = pm.HalfNormal("sigma_raw", sigma=sigma_guess, shape=n_lines,
-                                   initval=sigma_guess)
-        sigma = pm.Deterministic(
-            "sigma", pt.clip(sigma_raw, sigma_lo, sigma_hi)
+    def plot_corner(self, var_names: Sequence[str] | None = None):
+        var_names = list(var_names) if var_names is not None else ["amp", "mu", "sigma"]
+        return az.plot_pair(
+            self.trace, var_names=var_names, kind="kde", marginals=True, figsize=(9, 9)
         )
 
- 
-        # Exact analytic pixel-averaged flux density: integrate the
-        # Gaussian across each pixel's [lo, hi] wavelength edges using
-        # the error function, then divide by pixel width. This conserves
-        # line flux even when a line spans only a handful of pixels,
-        # unlike evaluating the Gaussian at the pixel center.
-        lo_data = pm.Data("pix_lo", pix_lo)
-        hi_data = pm.Data("pix_hi", pix_hi)
-        dw_data = pm.Data("pix_dw", pix_dw)
 
-        sqrt2 = np.sqrt(2.0)
-        z_hi = (hi_data[:, None] - mu[None, :]) / (sigma[None, :] * sqrt2)
-        z_lo = (lo_data[:, None] - mu[None, :]) / (sigma[None, :] * sqrt2)
-        # integral of A*exp(-0.5*((w-mu)/sigma)^2) dw over [lo,hi]
-        pixel_integral = (
-            amp[None, :] * sigma[None, :] * np.sqrt(np.pi / 2.0)
-            * (pt.erf(z_hi) - pt.erf(z_lo))
-        )
-        lines = pixel_integral / dw_data[:, None]
 
-        if fit_continuum:
-            c0 = pm.Normal("c0", mu=0.0, sigma=np.nanstd(flux))
-            c1 = pm.Normal("c1", mu=0.0, sigma=np.nanstd(flux) / max(np.ptp(wave), 1))
-            model_flux = model_flux + c0 + c1 * (wave_data - wave0)
 
-        pm.Deterministic("model_flux", model_flux)
-
-        pm.Normal("obs", mu=model_flux, sigma=flux_err, observed=flux)
-
-        trace = pm.sample(
-            draws=draws, tune=tune, chains=chains, cores=cores,
-            target_accept=target_accept, random_seed=random_seed,
-            progressbar=True,
-        )
-
-    return LineFitResult(
-        trace=trace, model=model, wave=wave, flux=flux,
-        flux_err=flux_err,
-        line_names=list(line_names), fit_continuum=fit_continuum, line_centers=list(line_centers),
+def fit_lines_exact(wave, flux, flux_err, line_names: Sequence[str], **kwargs) -> LineFitResult:
+    """Backwards-compatible wrapper: pixel-integrated fit of raw arrays (z = 0)."""
+    return LineFitter(line_names=line_names, exact_gaussian=True, **kwargs).fit_arrays(
+        wave, flux, flux_err
     )

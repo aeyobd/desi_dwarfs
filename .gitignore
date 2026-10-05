@@ -3,4 +3,14 @@
 .ipynb_checkpoints
 *.npz
 __pycache__
-pipes/
+pipes
+
+
+
+figures
+
+*.png
+
+*.pdf
+
+*.un~

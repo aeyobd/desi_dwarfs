@@ -43,6 +43,7 @@ class Spectrum:
 
     uncertainty: np.ndarray
     wave_dispersion: np.ndarray = None
+
     redshift: float = math.nan
     velocity_scale: float = 1
     meta: dict = field(default_factory=dict)
@@ -204,30 +205,35 @@ def smooth_spectrum(spec, kernel = Gaussian1DKernel(5)):
         wave_dispersion = np.sqrt(spec.wave_dispersion**2 + conv_kernel_std(kernel)**2), # TODO: this is probably wrong
         redshift = spec.redshift,
         velocity_scale = spec.velocity_scale,
+        flux_unit = spec.flux_unit,
+        wavelength_unit = spec.wavelength_unit,
         meta = spec.meta
+        )
 
 
-def clip_spectrum(spec, waverange):
-    lambda1, lambda2, lambda3, lambda4 = (win * (1+spectrum.redshift) for win in window)
+def clip_spectrum(spectrum, waverange):
+    lambda_min = waverange[0] * (1 + spectrum.redshift)
+    lambda_max = waverange[1] * (1 + spectrum.redshift)
 
 
-    imin = np.where(spectrum.wavelength > lambda1)[0][0]
-    imax = np.where(spectrum.wavelength < lambda4)[0][-1]
+    imin = np.where(spectrum.wavelength >= lambda_min)[0][0]
+    imax = np.where(spectrum.wavelength <= lambda_max)[0][-1]
     idxs = np.arange(imin, imax)
     flux = spectrum.flux
     wave = spectrum.wavelength
-
-    if restframe:
-        wave = wave / (1 + spectrum.redshift)
-        redshift = 0
-    else:
-        redshift = spectrum.redshift
+    redshift = spectrum.redshift
 
     
-    spec2 = desi_utils.Spectrum(flux=flux[idxs], 
-                                wavelength=wave[idxs], 
-                                uncertainty=spectrum.uncertainty[idxs], 
-                                wave_dispersion= None if spectrum.wave_dispersion is None else spectrum.wave_dispersion[idxs], 
-                               redshift = redshift, velocity_scale=spectrum.velocity_scale, meta=spectrum.meta)
+    spec2 = Spectrum(
+        flux = flux[idxs], 
+        wavelength = wave[idxs], 
+        uncertainty = spectrum.uncertainty[idxs], 
+        wave_dispersion = None if spectrum.wave_dispersion is None else spectrum.wave_dispersion[idxs], 
+        flux_unit = spectrum.flux_unit,
+        wavelength_unit = spectrum.wavelength_unit,
+        redshift = redshift, 
+        velocity_scale = spectrum.velocity_scale, 
+        meta = spectrum.meta
+    )
 
     return spec2
