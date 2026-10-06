@@ -25,8 +25,17 @@ def redshift_to_vel(redshift: float):
     Return the los velocity in km/s given a redshift. 
     """
     c = constants.c.to("km/s").value
-    vel = c*np.log(1 + redshift)   # eq.(8) of Cappellari (2017)
+    vel = c*np.log1p(redshift)   # eq.(8) of Cappellari (2017)
     return vel
+
+
+def vel_to_redshift(vel: float):
+    """
+        convert a LOS velocity to a redshift
+    """
+    c = constants.c.to("km/s").value
+    redshift = np.expm1(vel/c)
+    return redshift
 
 
 def load_sps(sps_file: str, spec:Spectrum, norm_range=[5070, 5950]):

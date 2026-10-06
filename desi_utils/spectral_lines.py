@@ -22,7 +22,7 @@ EMISSION_LINES = [
     'O3_4959A',
     'O3_5007A',
     'N2_5755A',
-    'He1r_5876A', 
+    'He1r_5876A',
     'O1_6300A', 
     'S3_6312A',
     'O1_6364A', # new
@@ -44,6 +44,13 @@ EMISSION_LINES = [
 
 
 
+BALMER_LABELS = {
+        'H1r_3970A': r"H$\epsilon$",
+        'H1r_4102A': r"H$\delta$",
+        'H1r_4341A': r"H$\gamma$", 
+        'H1r_4861A': r"H$\beta$",
+        'H1r_6563A' : r"H$\alpha$" 
+    }
 
 # Helium I wavelengths from NIST as pyneb is not setup properly
 HE_WAVELENGTHS = {
@@ -54,6 +61,14 @@ HE_WAVELENGTHS = {
         'He1r_7281A': 7281.349,
 }
 
+
+BALMER_WAVELENGTHS = {
+    "halpha": 6563,
+    "hbeta": 4861,
+    "hgamma": 4340,
+    "hdelta": 4102,
+    "hepsilon": 3970,
+}
 
 def get_line_element(emline):
     return emline.split("_")[0]
@@ -88,8 +103,8 @@ def is_recomb_line(line):
 
 
 def get_named_wavelength(emline):
-    if get_line_element(emline) == "h":
-        return  balmer_line_wavelengths[emline]
+    if emline in BALMER_WAVELENGTHS.keys():
+        return  BALMER_WAVELENGTHS[emline]
         
     matches = re.findall(r"\d{4}", emline)
     if len(matches) == 1:
@@ -146,6 +161,9 @@ def int_to_roman(i):
     return ["i", "ii", "iii", "iv", "v", "vi", "vii", "viii", "ix", "x"][i-1]
             
 def format_line(emline):
+
+    if emline in BALMER_LABELS.keys():
+        return BALMER_LABELS[emline]
 
     line = get_pyneb_line(emline)
     roman = int_to_roman(int(line.spec))

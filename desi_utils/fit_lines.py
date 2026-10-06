@@ -36,6 +36,7 @@ _SQRT2 = np.sqrt(2.0)
 _SQRT_HALF_PI = np.sqrt(np.pi / 2.0)
 _SQRT_2PI = np.sqrt(2.0 * np.pi)
 
+_ARVIZ_SUMMARY_KWARGS = dict(kind = "all_median", ci_prob=0.68)
 
 # --------------------------------------------------------------------------
 # Pure helpers (shared by the PyMC model and the numpy post-processing so the
@@ -388,11 +389,12 @@ class LineFitResult:
             var_names = ["amp", "mu", "sigma", "line_flux"]
             if self.fit_continuum:
                 var_names += ["c0", "c1"]
-        return az.summary(self.trace, var_names=list(var_names))
+        return az.summary(self.trace, var_names=list(var_names), **_ARVIZ_SUMMARY_KWARGS)
 
     def line_fluxes(self):
         """Integrated flux per line, amp * sigma * sqrt(2 pi), from the posterior."""
-        return az.summary(self.trace, var_names=["line_flux"])
+        return az.summary(self.trace, var_names=["line_flux"],
+                **_ARVIZ_SUMMARY_KWARGS)
 
     # ---- plotting --------------------------------------------------------
     def _x(self, wave: np.ndarray, restframe: bool) -> np.ndarray:
@@ -403,7 +405,8 @@ class LineFitResult:
     def _get_ax(ax: Axes | None) -> Axes:
         return plt.subplots(figsize=(9, 5))[1] if ax is None else ax
 
-    def _plot_data_and_fit(self, ax, mask, restframe, components, interval):
+    def _plot_data_and_fit(self, ax, mask, restframe, components, interval,
+            show_legend=True):
         x = self._x(self.wave, restframe)
         ax.errorbar(
             x[mask], self.flux[mask],
@@ -418,7 +421,8 @@ class LineFitResult:
             ax.plot(x[mask], comp[mask], "--", lw=1.3, label=name, zorder=2)
         ax.set_xlabel("Rest wavelength" if restframe else "Wavelength")
         ax.set_ylabel("Flux")
-        ax.legend(fontsize=8)
+        if show_legend:
+            ax.legend(fontsize=8)
 
     def _mean_components(self, indices: Sequence[int]):
         comps, cont = self._evaluate(self.wave, self._means())
@@ -430,13 +434,15 @@ class LineFitResult:
         show_components: bool = False,
         restframe: bool = False,
         interval: float | None = 0.94,
+        show_legend: bool = True,
     ) -> Axes:
         ax = self._get_ax(ax)
         components = (
             self._mean_components(range(len(self.line_names))) if show_components else []
         )
         self._plot_data_and_fit(
-            ax, np.ones(self.wave.size, dtype=bool), restframe, components, interval
+            ax, np.ones(self.wave.size, dtype=bool), restframe, components,
+            interval, show_legend=show_legend
         )
         return ax
 
@@ -447,6 +453,7 @@ class LineFitResult:
         wave_range: float = 30.0,
         restframe: bool = False,
         interval: float | None = 0.94,
+        show_legend: bool = True,
     ) -> Axes:
         """Zoom on one line; `wave_range` is in the displayed frame."""
         if line not in self.line_names:
@@ -456,7 +463,9 @@ class LineFitResult:
         center = float(self._x(np.asarray(self.line_centers[idx]), restframe))
         x = self._x(self.wave, restframe)
         mask = np.abs(x - center) < wave_range
-        self._plot_data_and_fit(ax, mask, restframe, self._mean_components([idx]), interval)
+        self._plot_data_and_fit(ax, mask, restframe,
+                self._mean_components([idx]), interval, show_legend =
+                show_legend)
         return ax
 
     def plot_corner(self, var_names: Sequence[str] | None = None):

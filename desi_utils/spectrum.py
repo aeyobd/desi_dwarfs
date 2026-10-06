@@ -216,8 +216,16 @@ def clip_spectrum(spectrum, waverange):
     lambda_max = waverange[1] * (1 + spectrum.redshift)
 
 
-    imin = np.where(spectrum.wavelength >= lambda_min)[0][0]
-    imax = np.where(spectrum.wavelength <= lambda_max)[0][-1]
+    if lambda_min <= spectrum.wavelength[0]:
+        imin = 0
+    else:
+        imin = np.where(spectrum.wavelength >= lambda_min)[0][0]
+
+    if lambda_max >= spectrum.wavelength[-1]:
+        imax = len(spectrum.wavelength) - 1
+    else:
+        imax = np.where(spectrum.wavelength <= lambda_max)[0][-1]
+
     idxs = np.arange(imin, imax)
     flux = spectrum.flux
     wave = spectrum.wavelength
