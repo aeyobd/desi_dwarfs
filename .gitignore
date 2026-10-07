@@ -14,3 +14,5 @@ figures
 *.pdf
 
 *.un~
+*.swp
+example_fits
