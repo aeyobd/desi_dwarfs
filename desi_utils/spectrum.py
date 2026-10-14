@@ -1,16 +1,18 @@
 from __future__ import annotations
+import warnings
 import math
 from dataclasses import dataclass, field
 
 import numpy as np
 from matplotlib import pyplot as plt
 from astropy import units as u
-import warnings
-
+from astropy import constants as c
+from astropy.convolution import convolve, Gaussian1DKernel
+import spectres 
 from ppxf import ppxf_util
 
-from astropy.convolution import convolve, Gaussian1DKernel
 
+C_KMS = c.c.to("km/s").value
 
 def inv_var_to_std(inv_var: np.ndarray):
     """
@@ -70,7 +72,7 @@ class Spectrum:
         )
 
 
-    def plot(self, ax=None, restframe=False, plot_uncertainty=False, xlim=None, lw=0.5, **kwargs):
+    def plot(self, ax=None, restframe=False, plot_uncertainty=False, xlim=None, **kwargs):
         if ax is None:
             ax = plt.gca()
 
@@ -107,9 +109,9 @@ class Spectrum:
 
             units = str(self.wavelength_unit)
             units = units.replace("Angstrom", r"\AA")
-            ax.set_xlabel(f"$\\lambda_\\text{{{suffix}}}\ / \ {units}$")
-        if ax.get_ylabel() == '':
+            ax.set_xlabel(f"$\\lambda_\\text{{{suffix}}}\\ / \\ {units}$")
 
+        if ax.get_ylabel() == '':
             units = str(self.flux_unit)
             units = units.replace("Angstrom", r"\AA{}")
             ax.set_ylabel(f"flux / {units}")
@@ -161,8 +163,7 @@ class Spectrum:
 
 
 
-
-def log_rebin_spectrum(spec: Spectrum, flux=False):
+def log_rebin_spectrum_ppxf(spec: Spectrum, flux=False):
     flux_resam, log_lambda_resam, velscale_resam = ppxf_util.log_rebin(spec.wavelength, spec.flux, flux=flux)
     lambda_resam = np.exp(log_lambda_resam)
     wave_dispersion_resam = np.interp(lambda_resam, spec.wavelength, spec.wave_dispersion)
@@ -177,6 +178,36 @@ def log_rebin_spectrum(spec: Spectrum, flux=False):
         wave_dispersion =  wave_dispersion_resam,
         uncertainty = uncertainty_resam,
         velocity_scale = velscale_resam,
+        redshift = spec.redshift,
+        meta = spec.meta,
+        flux_unit = spec.flux_unit, 
+        wavelength_unit = spec.wavelength_unit,
+    ), flux_scale
+
+
+def log_rebin_spectrum(spec: Spectrum, normalize_median=False):
+    lambda_resam = np.logspace(np.log10(spec.wavelength[0]), np.log10(spec.wavelength[-1]), 
+            len(spec.wavelength))
+
+    flux_resam, uncertainty_resam = spectres.spectres(lambda_resam, spec.wavelength, 
+            spec.flux, spec.uncertainty, fill=0)
+
+    wave_dispersion_resam = np.interp(lambda_resam, spec.wavelength, spec.wave_dispersion)
+
+    if normalize_median:
+        flux_scale = np.median(flux_resam)
+    else:
+        flux_scale = 1
+
+    flux_resam /= flux_scale
+    velscale = C_KMS * np.median(np.diff(np.log(lambda_resam)))
+
+    return Spectrum(
+        wavelength = lambda_resam,
+        flux = flux_resam,
+        wave_dispersion =  wave_dispersion_resam,
+        uncertainty = uncertainty_resam,
+        velocity_scale = velscale,
         redshift = spec.redshift,
         meta = spec.meta,
         flux_unit = spec.flux_unit, 

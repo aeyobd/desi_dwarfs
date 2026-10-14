@@ -477,8 +477,3 @@ class LineFitResult:
 
 
 
-def fit_lines_exact(wave, flux, flux_err, line_names: Sequence[str], **kwargs) -> LineFitResult:
-    """Backwards-compatible wrapper: pixel-integrated fit of raw arrays (z = 0)."""
-    return LineFitter(line_names=line_names, exact_gaussian=True, **kwargs).fit_arrays(
-        wave, flux, flux_err
-    )

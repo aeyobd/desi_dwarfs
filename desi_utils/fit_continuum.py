@@ -85,8 +85,7 @@ class SEDModel:
         fwhm_gal_dic = {"lam": spectrum.wavelength, "fwhm": spectrum.wave_dispersion}
 
         gas_templates, gas_names, line_wave = emission_lines(
-            sps.ln_lam_temp, lam_range_gal, fwhm_gal_dic, tie_balmer=self.tie_balmer,
-            limit_doublets=False)
+            sps.ln_lam_temp, lam_range_gal, fwhm_gal_dic)
 
         templates = np.column_stack([stars_templates, gas_templates])
 
@@ -127,6 +126,55 @@ class SEDModel:
         return p
 
 
+    def fit_bootstrap(self, spectrum, n_samples=100):
+        sps = load_sps(self.sps_file, spectrum)
+        reg_dim = sps.templates.shape[1:]
+        stars_templates = sps.templates.reshape(sps.templates.shape[0], -1)
+        redshift = spectrum.redshift
+
+        lam_range_gal = np.array([np.min(spectrum.wavelength), np.max(spectrum.wavelength)])/(1 + redshift)
+        fwhm_gal_dic = {"lam": spectrum.wavelength, "fwhm": spectrum.wave_dispersion}
+
+        gas_templates, gas_names, line_wave = emission_lines(
+            sps.ln_lam_temp, lam_range_gal, fwhm_gal_dic)
+
+        templates = np.column_stack([stars_templates, gas_templates])
+
+        n_temps = stars_templates.shape[1]
+        n_balmer = np.sum(["r_" in a for a in gas_names])
+        n_forbidden = len(gas_names) - n_balmer
+
+        component = [0]*n_temps + [1]*n_balmer + [2]*n_forbidden
+        gas_component = np.array(component) > 0  # gas_component=True for gas templates
+
+        ic = self.get_ic(spectrum.redshift)
+
+        uncertainty = copy(spectrum.uncertainty)
+        uncertainty[~np.isfinite(uncertainty)] = 1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
+        uncertainty[uncertainty == 0] =  1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
+
+        ppxf_fits = []
+        for _ in range(n_samples):
+            flux = spectrum.flux + np.random.randn(len(spectrum.flux)) * uncertainty
+
+            p = ppxf(templates, flux, uncertainty, spectrum.velocity_scale, ic, 
+                moments = self.moments,
+                degree = -1, mdegree = 10, 
+                lam = spectrum.wavelength, 
+                lam_temp =  sps.lam_temp,
+                regul = 1/self.regul_err, 
+                reg_dim = reg_dim, 
+                component = component,
+                gas_component = gas_component, 
+                gas_names = gas_names,
+                gas_reddening = self.gas_reddening
+            )
+
+            ppxf_fits.append(p)
+
+        return ppxf_fits
+
+
     def __str__(self):
         d = {
             "SEDModel": asdict(self)
@@ -143,8 +191,7 @@ def fit_local_continuum(spec, windows):
     pass
 
 
-def emission_lines(ln_lam_temp, lam_range_gal, FWHM_gal, pixel=True,
-                   tie_balmer=False, limit_doublets=False, vacuum=True):
+def emission_lines(ln_lam_temp, lam_range_gal, FWHM_gal, pixel=True, vacuum=True):
     """Generates Gaussian emission line templates for pPXF.
 
     This function creates an array of Gaussian templates for gas emission
