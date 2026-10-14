@@ -30,11 +30,9 @@ The largest ongoing and future surveys are LSST, Euclid, Roman (photometry) and 
 
 
 
-## ISM physics
-
-### The radiation field
 
 
+# ISM physics
 
 ## Emission line physics
 
@@ -78,7 +76,51 @@ This implies that the hydrogen Balmer ratios only depend on temperature.
 
 
 
-## Abundance measurements in emission line dwarf galaxies
+
+
+
+
+
+
+# Fitting a galaxy spectrum
+
+With the advent of high quality spectra of galaxies, one problem is to find a model for the stellar population and interstellar medium of a galaxy given its detailed spectrum.
+
+### Stellar modelling
+
+The classic template-fitting method relies on a pre-computed library of templates of stellar populations. Each template is built up of a stellar population with a given metallicity, IMF, spectral library, and age. 
+
+Occasionally, Bayesian models 
+
+
+
+### Star formation histories
+
+
+
+### ISM modelling
+
+The interstellar medium and gas-phase metallicity are variusly modelled in spectral fitting. 
+
+The simplest method is to mask emission line regions when fitting stellar templates to avoid biases. Then the emission lines can be fit individually with gaussian line profiles. 
+
+
+
+### Methodology
+
+With a library or methodology for creating the stellar 
+
+
+
+### Comparison of codes
+
+#### PPXF
+
+pPXF (Penalized PiXel Fitting) is a package which fits galaxy spectra using a penalized least-squares approach. pPXF solves for both gas phase emission line strengths and the age metallicity distribution of the stellar population. In addition, pPXF can fit the kinematics of each component. Besides the mean velocity and dispersion, pPXF can find the weights for higher order gaussian hermite polynomials. 
+
+pPXF is extremely fast (especially compared to bayesian methods) but requires Monte Carlo / Bootstrapping to properly estimate the uncertainties of fit parameters. 
+
+# Abundance measurements in emission line dwarf galaxies
 
 
 
@@ -105,4 +147,10 @@ The dust extenction (causing differential reddining of spectral lines) is determ
 
 
 # Annotated Bibliography
+
+
+
+### @cappellari+emsellem2004: Parametric recovery of line-of-sight velocity dispersions form absorption-line spectra of galaxies via penalized likelihood
+
+This paper presents the original pPXF algorithm (before the code was released). The main idea is to use a pixel-based likelihood penalized on the model parameters?
 
