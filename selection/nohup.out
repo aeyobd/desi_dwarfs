@@ -1,0 +1,51 @@
+665504
+647240
+after removing duplicates 645789
+after fracflux cut 622613
+nii6583 246730
+halpha 246433
+oiii5007 212220
+hbeta 206065
+SNR 178822
+Halpha 176709
+176709
+writing catalogue
+Traceback (most recent call last):
+  File "/dataserver/users/boyea/desi_dwarfs/selection/select_good_dwarfs.py", line 64, in <module>
+    good_dwarfs.write(outfile)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/table/connect.py", line 146, in __call__
+    self.registry.write(tbl, *args, **kwargs)
+    ~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/registry/core.py", line 395, in write
+    return writer(data, *args, **kwargs)
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/connect.py", line 522, in write_table_fits
+    table_hdu.writeto(output)
+    ~~~~~~~~~~~~~~~~~^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/base.py", line 1554, in writeto
+    hdulist.writeto(name, output_verify, overwrite=overwrite, checksum=checksum)
+    ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/hdulist.py", line 1067, in writeto
+    hdu._writeto(hdulist._file)
+    ~~~~~~~~~~~~^^^^^^^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/base.py", line 646, in _writeto
+    self._writeto_internal(fileobj, inplace, copy)
+    ~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/base.py", line 652, in _writeto_internal
+    data_offset, data_size = self._writedata(fileobj)
+                             ~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/base.py", line 583, in _writedata
+    size += self._writedata_internal(fileobj)
+            ~~~~~~~~~~~~~~~~~~~~~~~~^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/hdu/table.py", line 1001, in _writedata_internal
+    fileobj.writearray(piece)
+    ~~~~~~~~~~~~~~~~~~^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/file.py", line 478, in writearray
+    _array_to_file(array, self._file)
+    ~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/util.py", line 563, in _array_to_file
+    return write(arr, outfile)
+  File "/Users/users/boyea/.local/lib/python3.13/site-packages/astropy/io/fits/util.py", line 538, in <lambda>
+    write = lambda a, f: a.tofile(f)
+                         ~~~~~~~~^^^
+KeyboardInterrupt

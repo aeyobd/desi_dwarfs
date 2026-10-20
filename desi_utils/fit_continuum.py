@@ -14,7 +14,7 @@ from .spectrum import Spectrum
 from .spectral_lines import EMISSION_LINES, get_wavelength
 import tomli_w
 
-SPS_DIR = os.path.join(os.path.dirname(__file__), "..", "sps_templates")
+SPS_DIR = os.path.join(os.path.dirname(__file__), "..", "spectral_fitting/sps_templates")
 
 
 

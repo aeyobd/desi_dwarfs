@@ -72,7 +72,7 @@ class Spectrum:
         )
 
 
-    def plot(self, ax=None, restframe=False, plot_uncertainty=False, xlim=None, **kwargs):
+    def plot(self, ax=None, restframe=False, plot_uncertainty=False, xlim=None, lw=0.5, **kwargs):
         if ax is None:
             ax = plt.gca()
 
@@ -93,7 +93,7 @@ class Spectrum:
             ax.set_xlim(xlim)
 
 
-        p = ax.plot(wave, flux, lw=0.5, **kwargs)
+        p = ax.plot(wave, flux, lw=lw, **kwargs)
 
         if plot_uncertainty:
             color = p[0].get_color()
@@ -200,6 +200,7 @@ def log_rebin_spectrum(spec: Spectrum, normalize_median=False):
         flux_scale = 1
 
     flux_resam /= flux_scale
+    uncertainty_resam /= flux_scale
     velscale = C_KMS * np.median(np.diff(np.log(lambda_resam)))
 
     return Spectrum(

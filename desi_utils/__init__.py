@@ -4,7 +4,9 @@ from .fit_continuum import load_sps, SEDModel
 from .spectrum import Spectrum
 
 
-# from . import spectrum
-# from . import fit_continuum
-# from . import spectral_lines
-# from . import fit_lines
+from . import spectrum
+from . import fit_continuum
+from . import spectral_lines
+from . import fit_lines
+from . import get_data
+from . import plotting
