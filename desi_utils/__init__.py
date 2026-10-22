@@ -10,3 +10,4 @@ from . import spectral_lines
 from . import fit_lines
 from . import get_data
 from . import plotting
+from . import catalogue_helpers

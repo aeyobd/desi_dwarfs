@@ -11,9 +11,9 @@
 # - H$\alpha$ equivalent width greater than 14 (avoiding diffuse intergalactic medium contamination)
 
 import os
-
 from pathlib import Path
 from astropy.table import Table, unique
+from astropy.io import fits
 import numpy as np
 
 
@@ -24,45 +24,53 @@ if outfile.exists():
 
 
 # ## Load the catalogue
-dwarf_cat = Table.read("../data/stellar_mass_emline_dwarfs.fits")
+dwarf_main = Table.read("../data/desi_dr1_dwarf_catalog.fits", hdu=1)
+dwarf_z = Table.read("../data/desi_dr1_dwarf_catalog.fits", hdu=2)
+dwarf_phot = Table.read("../data/desi_dr1_dwarf_catalog.fits", hdu=3)
+dwarf_fsf = Table.read("../data/desi_dr1_dwarf_catalog.fits", hdu=4)
 
 
-# ## Remove duplicated targets
-filt_primary = dwarf_cat["zcat_primary"] == b't'
-print(len(dwarf_cat))
-print(np.sum(filt_primary))
-primary_cat = dwarf_cat[filt_primary]
-primary_cat.sort("snr_med", reverse=True)
-primary_cat = unique(primary_cat, "targetid")
-print("after removing duplicates", len(primary_cat))
+assert np.all(dwarf_fsf["TARGETID"] == dwarf_z["TARGETID"])
+assert np.all(dwarf_fsf["TARGETID"] == dwarf_main["TARGETID"])
+assert np.all(dwarf_fsf["TARGETID"] == dwarf_phot["TARGETID"])
 
 
+# check all primary catalogue and no duplicates
+filt_primary = dwarf_z["ZCAT_PRIMARY"]
+assert np.all(filt_primary)
+assert len(filt_primary) == len(np.unique(dwarf_main["TARGETID"]))
 
-filt = primary_cat["zcat_primary"] == b't'
 
-filt &= primary_cat["fracflux_g"] < 0.3
-filt &= primary_cat["fracflux_r"] < 0.3
-filt &= primary_cat["fracflux_z"] < 0.3
+filt = filt_primary
+
+filt &= dwarf_phot["FRACFLUX_G"] < 0.3
+filt &= dwarf_phot["FRACFLUX_R"] < 0.3
+filt &= dwarf_phot["FRACFLUX_Z"] < 0.3
 print("after fracflux cut", np.sum(filt))
 
-required_lines = ["nii6583", "halpha", "oiii5007", "hbeta"]
+required_lines = ["NII_6584", "HALPHA", "OIII_5007", "HBETA"]
 for line in required_lines:
-    filt &= primary_cat[f"{line}_flux"] / primary_cat[f"{line}_fluxerr"] > 3
+    filt &= dwarf_fsf[f"{line}_FLUX"] / dwarf_fsf[f"{line}_FLUX_IVAR"]**-0.5 > 3
     print(line, np.sum(filt))
 
-filt &= primary_cat["snr_med"] > 2
+filt &= dwarf_fsf["SNR_R"] > 2
 print("SNR", np.sum(filt))
 
-filt &= primary_cat["halpha_ew"] > 14
-print("Halpha", np.sum(filt))
 
-print("Halpha EW cut", sum(filt))
-
-
-filt &= primary_cat["logm_cigale"] < 9.0
-print("mass cut", np.sum(filt))
-good_dwarfs = primary_cat[filt]
+good_main = dwarf_main[filt]
+good_z = dwarf_z[filt]
+good_phot = dwarf_phot[filt]
+good_fsf = dwarf_fsf[filt]
 
 print("writing catalogue")
-good_dwarfs.write(outfile)
+hdr = fits.Header()
+hdus = fits.HDUList([
+    fits.PrimaryHDU(header=hdr),
+    fits.BinTableHDU(good_main),
+    fits.BinTableHDU(good_z),
+    fits.BinTableHDU(good_phot),
+    fits.BinTableHDU(good_fsf),
+])
 
+
+hdus.writeto(outfile)
