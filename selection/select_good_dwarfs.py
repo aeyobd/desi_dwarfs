@@ -42,10 +42,15 @@ assert len(filt_primary) == len(np.unique(dwarf_main["TARGETID"]))
 
 
 filt = filt_primary
+filt &= dwarf_main["DWARF_MASKBIT"] == 0
+filt &= dwarf_main["MSTAR_MASKBIT"] == 0
+
 
 filt &= dwarf_phot["FRACFLUX_G"] < 0.3
 filt &= dwarf_phot["FRACFLUX_R"] < 0.3
 filt &= dwarf_phot["FRACFLUX_Z"] < 0.3
+
+
 print("after fracflux cut", np.sum(filt))
 
 required_lines = ["NII_6584", "HALPHA", "OIII_5007", "HBETA"]

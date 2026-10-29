@@ -28,8 +28,7 @@ def get_spectra(targetid):
         targetid = [int(targetid)]
 
 
-    inc = ['sparcl_id', 'specid', 'data_release', 'redshift', 'flux',
-       'wavelength', 'model', 'ivar', 'mask', 'spectype', 'ra', 'dec', 'wave_sigma']
+    inc = "ALL"
 
 
     client = SparclClient()

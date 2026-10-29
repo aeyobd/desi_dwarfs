@@ -4,18 +4,16 @@ from dataclasses import dataclass, asdict, field
 import math
 
 import numpy as np
-from astropy import constants
 
 import ppxf.sps_util as ppxf_lib
 from ppxf.ppxf import ppxf
 from ppxf.ppxf_util import gaussian
 
-from .spectrum import Spectrum
+from .spectrum import Spectrum, C_KMS
 from .spectral_lines import EMISSION_LINES, get_wavelength
 import tomli_w
 
 SPS_DIR = os.path.join(os.path.dirname(__file__), "..", "spectral_fitting/sps_templates")
-
 
 
 def redshift_to_vel(redshift: float):
@@ -24,8 +22,7 @@ def redshift_to_vel(redshift: float):
 
     Return the los velocity in km/s given a redshift. 
     """
-    c = constants.c.to("km/s").value
-    vel = c*np.log1p(redshift)   # eq.(8) of Cappellari (2017)
+    vel = C_KMS * np.log1p(redshift)   # eq.(8) of Cappellari (2017)
     return vel
 
 
@@ -33,12 +30,11 @@ def vel_to_redshift(vel: float):
     """
         convert a LOS velocity to a redshift
     """
-    c = constants.c.to("km/s").value
-    redshift = np.expm1(vel/c)
+    redshift = np.expm1(vel / C_KMS)
     return redshift
 
 
-def load_sps(sps_file: str, spec:Spectrum, norm_range=[5070, 5950]):
+def load_sps(sps_file: str, spec:Spectrum, norm_range=(5070, 5950)):
     """
         load_sps(sps_file, redshift, lam_gal, fwhm_gal, 
         norm_range)
@@ -46,10 +42,20 @@ def load_sps(sps_file: str, spec:Spectrum, norm_range=[5070, 5950]):
     Load the Stellar Population file, resampling on the given lambda and fwhm of the spectra, 
     scaling by the redshift, and 
     """
-    fwhm_gal_dic = {"lam": spec.wavelength, "fwhm": spec.wave_dispersion}
+    fwhm_gal_dic = fwhm_dictionary(spec)
     sps = ppxf_lib.sps_lib(os.path.join(SPS_DIR, sps_file), spec.velocity_scale, fwhm_gal_dic, norm_range=norm_range)
     return sps
 
+
+def fwhm_dictionary(spec:Spectrum):
+    d = {"lam": spec.wavelength, "fwhm": sigma_to_fwhm(spec.wave_dispersion)}
+    return d
+
+
+
+def sigma_to_fwhm(sigma):
+    # see https://mathworld.wolfram.com/GaussianFunction.html
+    return 2 * np.sqrt(2*np.log(2)) * sigma
 
 @dataclass
 class SEDModel:
@@ -63,6 +69,9 @@ class SEDModel:
     regul_err: float = 0.01
 
 
+    _templates = None
+    _spec: Spectrum = None
+
     def get_ic(self, redshift):
         vel = redshift_to_vel(redshift)
         if len(self.ic) > 0:
@@ -75,104 +84,91 @@ class SEDModel:
 
         return ic
 
-    def fit(self, spectrum):
+
+    def _is_compatible_spectrum(self, spec):
+        spec2 = self._spec
+        return (np.all(np.isclose(spec.wavelength, spec2.wavelength)) 
+                and np.isclose(spec.redshift, spec2.redshift)
+                and np.all(np.isclose(spec.wave_dispersion, spec2.wave_dispersion))
+            )
+
+
+    def load_templates(self, spectrum):
+        if self._spec is not None and self._is_compatible_spectrum(spectrum):
+            return
         sps = load_sps(self.sps_file, spectrum)
-        reg_dim = sps.templates.shape[1:]
         stars_templates = sps.templates.reshape(sps.templates.shape[0], -1)
         redshift = spectrum.redshift
 
         lam_range_gal = np.array([np.min(spectrum.wavelength), np.max(spectrum.wavelength)])/(1 + redshift)
-        fwhm_gal_dic = {"lam": spectrum.wavelength, "fwhm": spectrum.wave_dispersion}
+        fwhm_gal_dic = fwhm_dictionary(spectrum)
 
         gas_templates, gas_names, line_wave = emission_lines(
             sps.ln_lam_temp, lam_range_gal, fwhm_gal_dic)
 
-        templates = np.column_stack([stars_templates, gas_templates])
+        self._templates = np.column_stack([stars_templates, gas_templates])
+        self._stars_templates = stars_templates
+        self._gas_names = gas_names
+        self._line_wave = line_wave
+        self._sps = sps
+        self._spec = spectrum
 
-        n_temps = stars_templates.shape[1]
-        n_balmer = np.sum(["r_" in a for a in gas_names])
-        n_forbidden = len(gas_names) - n_balmer
+
+    @property
+    def components(self):
+        n_temps = self._stars_templates.shape[1]
+        n_balmer = np.sum(["r_" in a for a in self._gas_names])
+        n_forbidden = len(self._gas_names) - n_balmer
 
         component = [0]*n_temps + [1]*n_balmer + [2]*n_forbidden
-        gas_component = np.array(component) > 0  # gas_component=True for gas templates
+        return component
 
-        ic = self.get_ic(spectrum.redshift)
+    @property
+    def gas_components(self):
+        return np.array(self.components) > 0
 
-        uncertainty = copy(spectrum.uncertainty)
+    @property
+    def uncertainty(self):
+        uncertainty = copy(self._spec.uncertainty)
         uncertainty[~np.isfinite(uncertainty)] = 1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
         uncertainty[uncertainty == 0] =  1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
+        return uncertainty
 
-        p = ppxf(templates, spectrum.flux, uncertainty, spectrum.velocity_scale, ic, 
-            moments = self.moments,
-            degree = -1, mdegree = 10, 
-            lam = spectrum.wavelength, 
-            lam_temp =  sps.lam_temp,
-            regul = 1/self.regul_err, 
-            reg_dim = reg_dim, 
-            component = component,
-            gas_component = gas_component, 
-            gas_names = gas_names,
-            gas_reddening = self.gas_reddening
-        )
 
-        self.gas_component = gas_component
-        self.n_temps = n_temps
-        self.reg_dim = reg_dim
-        self.n_forbidden = n_forbidden
-        self.n_balmer = n_balmer
+    @property
+    def reg_dim(self):
+        return self._sps.templates.shape[1:]
+
+
+    def fit(self, spectrum):
+        ic = self.get_ic(spectrum.redshift)
+        self.load_templates(spectrum)
+        sps = self._sps
+
+
+        kwargs = {
+            "moments": self.moments,
+            "degree": -1,
+            "mdegree": 10,
+            "lam": spectrum.wavelength,
+            "lam_temp": sps.lam_temp,
+            "component": self.components,
+            "gas_component": self.gas_components,
+            "gas_names": self._gas_names,
+            "gas_reddening": self.gas_reddening,
+        }
+
+        if self.regul_err > 0:
+            kwargs["regul"] = 1/self.regul_err
+            kwargs["reg_dim"] = self.reg_dim
+
+        p = ppxf(self._templates, spectrum.flux, self.uncertainty, 
+                 spectrum.velocity_scale, ic, **kwargs)
 
         self.p_fit = p
 
         return p
 
-
-    def fit_bootstrap(self, spectrum, n_samples=100):
-        sps = load_sps(self.sps_file, spectrum)
-        reg_dim = sps.templates.shape[1:]
-        stars_templates = sps.templates.reshape(sps.templates.shape[0], -1)
-        redshift = spectrum.redshift
-
-        lam_range_gal = np.array([np.min(spectrum.wavelength), np.max(spectrum.wavelength)])/(1 + redshift)
-        fwhm_gal_dic = {"lam": spectrum.wavelength, "fwhm": spectrum.wave_dispersion}
-
-        gas_templates, gas_names, line_wave = emission_lines(
-            sps.ln_lam_temp, lam_range_gal, fwhm_gal_dic)
-
-        templates = np.column_stack([stars_templates, gas_templates])
-
-        n_temps = stars_templates.shape[1]
-        n_balmer = np.sum(["r_" in a for a in gas_names])
-        n_forbidden = len(gas_names) - n_balmer
-
-        component = [0]*n_temps + [1]*n_balmer + [2]*n_forbidden
-        gas_component = np.array(component) > 0  # gas_component=True for gas templates
-
-        ic = self.get_ic(spectrum.redshift)
-
-        uncertainty = copy(spectrum.uncertainty)
-        uncertainty[~np.isfinite(uncertainty)] = 1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
-        uncertainty[uncertainty == 0] =  1e10 * np.max(uncertainty[np.isfinite(uncertainty)])
-
-        ppxf_fits = []
-        for _ in range(n_samples):
-            flux = spectrum.flux + np.random.randn(len(spectrum.flux)) * uncertainty
-
-            p = ppxf(templates, flux, uncertainty, spectrum.velocity_scale, ic, 
-                moments = self.moments,
-                degree = -1, mdegree = 10, 
-                lam = spectrum.wavelength, 
-                lam_temp =  sps.lam_temp,
-                regul = 1/self.regul_err, 
-                reg_dim = reg_dim, 
-                component = component,
-                gas_component = gas_component, 
-                gas_names = gas_names,
-                gas_reddening = self.gas_reddening
-            )
-
-            ppxf_fits.append(p)
-
-        return ppxf_fits
 
 
     def __str__(self):
@@ -186,9 +182,6 @@ class SEDModel:
 
 
 
-
-def fit_local_continuum(spec, windows):
-    pass
 
 
 def emission_lines(ln_lam_temp, lam_range_gal, FWHM_gal, pixel=True, vacuum=True):

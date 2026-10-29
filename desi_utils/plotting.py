@@ -7,6 +7,7 @@ from astropy.nddata import block_reduce
 from astropy.nddata import CCDData
 
 
+
 def _get_spectra_xy(spec):
     if isinstance(spec, tuple):
         if len(spec) == 2:
@@ -219,3 +220,86 @@ def _get_img_data(img):
     img_data = np.moveaxis(img.data, 0, -1)[:, :, ::-1]
 
     return img_data
+
+
+
+
+def density_scatter(
+    x, y, bins=300, xlim=None, ylim=None, ax=None,
+    cmap=None, norm="log", scatter_below=3,
+    s=0.5, point_color="k", colorbar=False, cbar_label="count",
+    xlabel=None, ylabel=None, **hist_kwargs,
+):
+    """
+    2D-histogram density plot, with optional scatter points in sparse regions.
+
+    Parameters
+    ----------
+    x, y : array-like
+        Data. Non-finite values are dropped.
+    bins : int, [int, int], or array(s) of edges
+        Passed to hist2d.
+    xlim, ylim : (min, max), optional
+        Histogram range and axis limits. Defaults to the data range.
+    ax : matplotlib Axes, optional
+    cmap, norm : colormap and normalization ("log", "linear", or a Normalize).
+    scatter_below : int, optional
+        If given, bins with fewer than this many points are left blank and
+        their points are drawn individually instead.
+    s, point_color : marker size and color for those scatter points.
+    colorbar : bool
+        Add a colorbar.
+    **hist_kwargs : passed to ax.hist2d (e.g. vmin, vmax, rasterized).
+
+    Returns
+    -------
+    counts, xedges, yedges, image
+    """
+    if ax is None:
+        ax = plt.gca()
+
+    x = np.asarray(x, dtype=float).ravel()
+    y = np.asarray(y, dtype=float).ravel()
+    if x.shape != y.shape:
+        raise ValueError(f"x and y must have the same length ({x.size} vs {y.size})")
+
+    good = np.isfinite(x) & np.isfinite(y)
+    x, y = x[good], y[good]
+    if x.size == 0:
+        raise ValueError("no finite data points to plot")
+
+    if xlim is None:
+        xlim = (x.min(), x.max())
+    if ylim is None:
+        ylim = (y.min(), y.max())
+
+    in_range = (x >= xlim[0]) & (x <= xlim[1]) & (y >= ylim[0]) & (y <= ylim[1])
+    x, y = x[in_range], y[in_range]
+
+    rng = [xlim, ylim]
+
+    if scatter_below is not None:
+        # Find the count of the bin each point falls in
+        H, xe, ye = np.histogram2d(x, y, bins=bins, range=rng)
+        ix = np.clip(np.searchsorted(xe, x, side="right") - 1, 0, H.shape[0] - 1)
+        iy = np.clip(np.searchsorted(ye, y, side="right") - 1, 0, H.shape[1] - 1)
+        sparse = H[ix, iy] < scatter_below
+        hist_kwargs.setdefault("cmin", scatter_below)
+        ax.scatter(x[sparse], y[sparse], s=s, c=point_color,
+                   lw=0, rasterized=True, zorder=0)
+
+    counts, xedges, yedges, im = ax.hist2d(
+        x, y, bins=bins, range=rng, cmap=cmap, norm=norm, zorder=1, **hist_kwargs
+    )
+
+    ax.set_xlim(xlim)
+    ax.set_ylim(ylim)
+    if xlabel is not None:
+        ax.set_xlabel(xlabel)
+    if ylabel is not None:
+        ax.set_ylabel(ylabel)
+    if colorbar:
+        plt.colorbar(im, ax=ax, label=cbar_label)
+
+    #return counts, xedges, yedges, im
+    return
